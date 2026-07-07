@@ -1,0 +1,142 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>轻备忘</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <div class="app-bg"></div>
+    <main class="shell">
+      <aside class="rail">
+        <div class="brand">
+          <div class="brand-icon">Q</div>
+          <div>
+            <h1>轻备忘</h1>
+            <p>便签 · 提醒 · 常驻</p>
+          </div>
+        </div>
+
+        <nav class="nav" aria-label="主导航">
+          <button class="nav-item active" data-view="dashboard" type="button">今日工作台</button>
+          <button class="nav-item" data-view="notes" type="button">便签墙</button>
+          <button class="nav-item" data-view="reminders" type="button">提醒清单</button>
+        </nav>
+
+        <section class="glass settings-card">
+          <h2>后台策略</h2>
+          <label class="toggle-row">
+            <span><b>游戏/免打扰</b><small>只弹高优先级</small></span>
+            <input id="focusMode" type="checkbox" />
+          </label>
+          <label class="toggle-row">
+            <span><b>暂停提醒</b><small>托盘可恢复</small></span>
+            <input id="paused" type="checkbox" />
+          </label>
+          <label class="toggle-row">
+            <span><b>开机自启</b><small>登录后自动常驻</small></span>
+            <input id="autostart" type="checkbox" />
+          </label>
+        </section>
+      </aside>
+
+      <section class="workspace">
+        <header class="topbar">
+          <div>
+            <p class="eyebrow">Windows-first memo hub</p>
+            <h2 id="viewTitle">今日工作台</h2>
+            <p id="summary" class="muted">正在加载你的提醒和便签...</p>
+          </div>
+          <div class="top-actions">
+            <input id="searchInput" type="search" placeholder="搜索便签 / 提醒" />
+            <button id="quickNoteBtn" type="button">+ 便签</button>
+            <button id="quickReminderBtn" type="button" class="primary">+ 提醒</button>
+          </div>
+        </header>
+
+        <section class="stats-grid">
+          <article class="stat-card accent-blue"><span>待办提醒</span><b id="statReminder">0</b><small>未来与重复提醒</small></article>
+          <article class="stat-card accent-amber"><span>高优先级</span><b id="statHigh">0</b><small>免打扰仍弹出</small></article>
+          <article class="stat-card accent-mint"><span>便签</span><b id="statNotes">0</b><small>灵感和碎片记录</small></article>
+        </section>
+
+        <section class="composer-grid">
+          <article class="glass composer" id="noteComposer">
+            <div class="section-title">
+              <div><h3>便签编辑器</h3><p>写灵感、清单、游戏备注，支持置顶和颜色。</p></div>
+              <button id="cancelNoteEditBtn" type="button" class="ghost hidden">取消编辑</button>
+            </div>
+            <form id="noteForm">
+              <input id="noteEditingId" type="hidden" />
+              <div class="form-line two">
+                <label>标题<input id="noteTitleInput" maxlength="80" placeholder="例如：今天要做" /></label>
+                <label>颜色
+                  <select id="noteColorInput">
+                    <option value="blue">海盐蓝</option>
+                    <option value="amber">奶油黄</option>
+                    <option value="mint">薄荷绿</option>
+                    <option value="rose">桃粉</option>
+                    <option value="violet">紫藤</option>
+                    <option value="slate">石墨</option>
+                  </select>
+                </label>
+              </div>
+              <label>内容<textarea id="noteContentInput" rows="5" placeholder="随手记点什么。"></textarea></label>
+              <label class="pin-line"><input id="notePinnedInput" type="checkbox" /> 置顶这张便签</label>
+              <button id="saveNoteBtn" type="submit" class="primary wide">保存便签</button>
+            </form>
+          </article>
+
+          <article class="glass composer" id="reminderComposer">
+            <div class="section-title">
+              <div><h3>提醒编辑器</h3><p>可设重复和高优先级，后台低占用调度。</p></div>
+              <button id="cancelReminderEditBtn" type="button" class="ghost hidden">取消编辑</button>
+            </div>
+            <form id="reminderForm">
+              <input id="editingId" type="hidden" />
+              <div class="form-line two">
+                <label>标题<input id="titleInput" maxlength="80" required placeholder="例如：22:30 休息眼睛" /></label>
+                <label>时间<input id="dueInput" type="datetime-local" required /></label>
+              </div>
+              <div class="form-line two">
+                <label>重复
+                  <select id="repeatInput">
+                    <option value="none">不重复</option>
+                    <option value="daily">每天</option>
+                    <option value="weekly">每周</option>
+                    <option value="monthly">每月</option>
+                    <option value="interval_30">每 30 分钟</option>
+                    <option value="interval_60">每 60 分钟</option>
+                  </select>
+                </label>
+                <label>优先级
+                  <select id="priorityInput">
+                    <option value="normal">普通</option>
+                    <option value="high">高优先级</option>
+                  </select>
+                </label>
+              </div>
+              <label>通知正文<textarea id="notesInput" rows="3" placeholder="通知里会显示这里的内容。"></textarea></label>
+              <button id="submitBtn" type="submit" class="primary wide">保存提醒</button>
+            </form>
+          </article>
+        </section>
+
+        <section class="content-grid">
+          <article class="glass board" data-panel="notes">
+            <div class="section-title"><div><h3>便签墙</h3><p>置顶便签会固定在前面。</p></div></div>
+            <div id="noteList" class="note-grid"></div>
+          </article>
+          <article class="glass board" data-panel="reminders">
+            <div class="section-title"><div><h3>提醒清单</h3><p>按下一次提醒时间排序。</p></div></div>
+            <div id="reminderList" class="timeline"></div>
+          </article>
+        </section>
+      </section>
+    </main>
+
+    <div id="toast" class="toast hidden"></div>
+    <script src="./main.js"></script>
+  </body>
+</html>
