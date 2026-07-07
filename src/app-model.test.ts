@@ -391,7 +391,7 @@ describe('dashboard model helpers', () => {
   });
 
   it('infers reminder time from natural Chinese quick input', () => {
-    const now = new Date('2026-07-05T09:00:00+08:00');
+    const now = new Date(2026, 6, 5, 9, 0, 0);
 
     expect(inferReminderDateTimeLocal('半小时后喝水', now)).toBe('2026-07-05T09:30');
     expect(inferReminderDateTimeLocal('下午3点开会', now)).toBe('2026-07-05T15:00');

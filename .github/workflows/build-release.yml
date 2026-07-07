@@ -1,0 +1,92 @@
+name: Build desktop installers
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - 'v*'
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: ${{ matrix.label }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: Windows x64
+            os: windows-latest
+            artifact: windows-x64
+            rustTarget: x86_64-pc-windows-msvc
+            args: --target x86_64-pc-windows-msvc --bundles nsis
+          - label: macOS Apple Silicon
+            os: macos-latest
+            artifact: macos-apple-silicon
+            rustTarget: aarch64-apple-darwin
+            args: --target aarch64-apple-darwin --bundles app,dmg
+          - label: macOS Intel
+            os: macos-latest
+            artifact: macos-intel
+            rustTarget: x86_64-apple-darwin
+            args: --target x86_64-apple-darwin --bundles app,dmg
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rustTarget }}
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+          key: ${{ matrix.artifact }}
+
+      - name: Install frontend dependencies
+        run: npm ci --no-audit --no-fund
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Test
+        run: npm run test -- --run
+
+      - name: Build Tauri bundle
+        uses: tauri-apps/tauri-action@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          args: ${{ matrix.args }}
+          tagName: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || '' }}
+          releaseName: ${{ startsWith(github.ref, 'refs/tags/') && format('轻备忘 {0}', github.ref_name) || '' }}
+          releaseBody: |
+            轻备忘 AI 灵感作战桌桌面版安装包。
+
+            下载说明：
+            - Windows 用户下载 `*.exe` NSIS 安装包。
+            - Apple Silicon Mac 下载 `aarch64` / `apple-silicon` 产物。
+            - Intel Mac 下载 `x86_64` / `intel` 产物。
+          releaseDraft: false
+          prerelease: false
+          generateReleaseNotes: true
+          uploadWorkflowArtifacts: true
+          workflowArtifactNamePattern: qingmemo-${{ matrix.artifact }}-[bundle]
+          releaseAssetNamePattern: qingmemo-[version]-[platform]-[arch]-[bundle][ext]
+          updaterJsonPreferNsis: true
