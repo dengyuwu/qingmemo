@@ -4,9 +4,9 @@
 
 ## 下载安装
 
-进入 GitHub 右侧 **Releases** 区域，打开最新版本后下载对应系统安装包：
+进入 GitHub 右侧 **Releases** 区域，打开最新版本后下载对应系统安装包。不要在 **Tags** 页面找安装包，Tags 页面只显示 GitHub 自动生成的源码 `zip/tar.gz`。
 
-- Windows：下载 `*.exe`，例如 `qingmemo-0.1.3-windows-x86_64-nsis.exe` 或 `轻备忘_0.1.3_x64-setup.exe`。
+- Windows：下载 `*.exe`，例如 `qingmemo-0.1.3-windows-x64-nsis.exe` 或本地构建产物 `轻备忘_0.1.3_x64-setup.exe`。
 - macOS Apple Silicon：下载 `aarch64` / `apple-silicon` 的 `.dmg`。
 - macOS Intel：下载 `x86_64` / `intel` 的 `.dmg`。
 
