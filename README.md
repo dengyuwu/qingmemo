@@ -86,6 +86,10 @@ git tag v0.1.3
 git push origin v0.1.3
 ```
 
+## 友链与致谢
+
+- [LINUX DO](https://linux.do)：感谢社区提供开源交流与反馈土壤。
+
 ## 数据位置
 
 提醒和便签数据保存在系统应用数据目录下的 `qingmemo.sqlite3`，路径由 Tauri `app_data_dir` 自动解析。游戏化进度保存在 Tauri Store 的 `progress.json`。
