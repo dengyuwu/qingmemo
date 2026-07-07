@@ -6,7 +6,7 @@
 
 进入 GitHub 右侧 **Releases** 区域，打开最新版本后下载对应系统安装包：
 
-- Windows：下载 `*.exe`，例如 `qingmemo-0.1.2-windows-x86_64-nsis.exe` 或 `轻备忘_0.1.2_x64-setup.exe`。
+- Windows：下载 `*.exe`，例如 `qingmemo-0.1.3-windows-x86_64-nsis.exe` 或 `轻备忘_0.1.3_x64-setup.exe`。
 - macOS Apple Silicon：下载 `aarch64` / `apple-silicon` 的 `.dmg`。
 - macOS Intel：下载 `x86_64` / `intel` 的 `.dmg`。
 
@@ -68,7 +68,7 @@ src-tauri/target/release/qingmemo-win.exe
 NSIS 安装包：
 
 ```text
-src-tauri/target/release/bundle/nsis/轻备忘_0.1.2_x64-setup.exe
+src-tauri/target/release/bundle/nsis/轻备忘_0.1.3_x64-setup.exe
 ```
 
 ## 自动发布
@@ -82,8 +82,8 @@ src-tauri/target/release/bundle/nsis/轻备忘_0.1.2_x64-setup.exe
 发布新版本示例：
 
 ```powershell
-git tag v0.1.2
-git push origin v0.1.2
+git tag v0.1.3
+git push origin v0.1.3
 ```
 
 ## 数据位置
