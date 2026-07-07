@@ -73,11 +73,30 @@ describe('StickyWall', () => {
     const view = renderStickyWall([note], { onAskAiNextStep: vi.fn() });
     const archiveButton = view.querySelector('[aria-label="归档便签"]');
     const bubbledPointerDown = vi.fn();
+    const bubbledMouseDown = vi.fn();
     view.addEventListener('pointerdown', bubbledPointerDown);
+    view.addEventListener('mousedown', bubbledMouseDown);
 
     archiveButton?.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true }));
+    archiveButton?.dispatchEvent(new window.MouseEvent('mousedown', { bubbles: true }));
 
     expect(archiveButton).not.toBeNull();
     expect(bubbledPointerDown).not.toHaveBeenCalled();
+    expect(bubbledMouseDown).not.toHaveBeenCalled();
+  });
+
+  it('archives from the bottom-right action button without selecting the card', () => {
+    const onArchiveNote = vi.fn();
+    const onSelectionChange = vi.fn();
+    const view = renderStickyWall([note], { onArchiveNote, onSelectionChange });
+    const archiveButton = view.querySelector('[aria-label="归档便签"]');
+
+    act(() => {
+      archiveButton?.dispatchEvent(new window.MouseEvent('click', { bubbles: true }));
+    });
+
+    expect(archiveButton).not.toBeNull();
+    expect(onArchiveNote).toHaveBeenCalledWith(note.id);
+    expect(onSelectionChange).not.toHaveBeenCalled();
   });
 });

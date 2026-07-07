@@ -1,5 +1,5 @@
 import { motion, type PanInfo } from 'framer-motion';
-import { useMemo, useRef, useState, type MouseEvent, type PointerEvent, type ReactNode } from 'react';
+import { useMemo, useRef, useState, type MouseEvent, type PointerEvent, type ReactNode, type TouchEvent } from 'react';
 import { MIN_NOTE_HEIGHT, applyGroupDrag, compactSparseColumns, snapPoint, toLayoutPatch } from './layout';
 import { categoryHelp, categoryLabel, noteMood, noteMoodHelp } from './note-labels';
 import { buildWallExplorationState, countNotesByCategory, filterNotesByCategory, mergeVisibleNoteChanges, prepareVisibleNotes, type WallCategoryFilter, type WallExplorationMode } from './wall-filter';
@@ -481,7 +481,12 @@ export function StickyWall({
                 <span className="rounded-full bg-white/40 px-2.5 py-1 text-zinc-600/90 opacity-60 transition group-hover:hidden" title={stickyCategoryHelp(note)}>
                   {note.priority === 'high' ? '⚑ 高优先级' : note.attachments.length ? `📎 ${note.attachments.length}` : '自动配色'}
                 </span>
-                <div className="hidden items-center gap-1 group-hover:flex">
+                <div
+                  className="relative z-30 hidden items-center gap-1 rounded-2xl bg-white/12 p-0.5 group-hover:flex"
+                  onMouseDownCapture={stopCardPointerEvent}
+                  onPointerDownCapture={stopCardPointerEvent}
+                  onTouchStartCapture={stopCardPointerEvent}
+                >
                   {onAskAiNextStep && (
                     <NoteActionButton
                       label="AI 下一步"
@@ -598,6 +603,10 @@ function ContextMenuButton({
 }
 
 
+function stopCardPointerEvent(event: MouseEvent<HTMLElement> | PointerEvent<HTMLElement> | TouchEvent<HTMLElement>) {
+  event.stopPropagation();
+}
+
 function NoteActionButton({
   label,
   icon,
@@ -620,10 +629,17 @@ function NoteActionButton({
       type="button"
       aria-label={label}
       title={label}
-      className={`grid h-7 w-7 shrink-0 place-items-center rounded-xl border text-[11px] font-black leading-none shadow-[0_1px_3px_rgba(31,41,55,.08)] transition hover:-translate-y-0.5 hover:scale-[1.03] hover:shadow-[0_8px_18px_rgba(15,23,42,.10)] ${toneClass}`}
-      onPointerDownCapture={(event) => event.stopPropagation()}
-      onPointerDown={(event) => event.stopPropagation()}
-      onClick={onClick}
+      className={`relative z-30 grid h-8 w-8 shrink-0 place-items-center rounded-xl border text-[11px] font-black leading-none shadow-[0_1px_3px_rgba(31,41,55,.08)] transition hover:-translate-y-0.5 hover:scale-[1.03] hover:shadow-[0_8px_18px_rgba(15,23,42,.10)] ${toneClass}`}
+      onMouseDownCapture={stopCardPointerEvent}
+      onMouseDown={stopCardPointerEvent}
+      onPointerDownCapture={stopCardPointerEvent}
+      onPointerDown={stopCardPointerEvent}
+      onTouchStartCapture={stopCardPointerEvent}
+      onTouchStart={stopCardPointerEvent}
+      onClick={(event) => {
+        event.stopPropagation();
+        onClick(event);
+      }}
     >
       {icon}
     </button>

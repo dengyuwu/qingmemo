@@ -72,6 +72,7 @@ type AiInsight = {
   source: 'ai' | 'fallback';
   canAppendToNote?: boolean;
   canCreateReminder?: boolean;
+  canArchiveNote?: boolean;
   targetNoteIds?: number[];
 };
 type SidePanelMode = 'focus' | 'center' | 'timeline';
@@ -577,6 +578,26 @@ export default function App() {
       setError(formatError(caught));
     }
   }
+
+  async function archiveInsightNotes(noteIds: number[]) {
+    const ids = noteIds.filter((id) => notes.some((note) => note.id === id));
+    if (ids.length === 0) return;
+    setSaving(true);
+    setError(null);
+    try {
+      await Promise.all(ids.map((id) => invoke('archive_note', { id })));
+      const archivedIds = new Set(ids);
+      setNotes((current) => current.filter((note) => !archivedIds.has(note.id)));
+      setSelectedIds((current) => new Set([...current].filter((id) => !archivedIds.has(id))));
+      setUndoAction(ids.length === 1 ? { label: '便签已归档', kind: 'archive-note', id: ids[0] } : null);
+      setAiInsight(null);
+      setSuccess(ids.length === 1 ? '便签已归档。' : `${ids.length} 张便签已归档。`);
+    } catch (caught) {
+      setError(formatError(caught));
+    } finally {
+      setSaving(false);
+    }
+  }
   async function openAttachment(path: string) {
     setError(null);
     try {
@@ -978,6 +999,7 @@ export default function App() {
         source: result.source,
         canAppendToNote: selectedNotes.length > 0,
         canCreateReminder: true,
+        canArchiveNote: selectedNotes.length > 0,
         targetNoteIds: selectedNotes.map((note) => note.id),
       });
       setSuccess('AI 下一步已经生成。');
@@ -988,6 +1010,7 @@ export default function App() {
         source: 'fallback',
         canAppendToNote: selectedNotes.length > 0,
         canCreateReminder: true,
+        canArchiveNote: selectedNotes.length > 0,
         targetNoteIds: selectedNotes.map((note) => note.id),
       });
     } finally {
@@ -1506,6 +1529,7 @@ ${note.content}`) === 'waiting').slice(0, 5);
         onCopy={(title, text) => void copyInsightText(title, text)}
         onAppendToNote={(insight) => void appendInsightToSelectedNotes(insight)}
         onCreateReminder={(insight) => void createReminderFromText(insight.text, insight.title)}
+        onArchiveNotes={(noteIds) => void archiveInsightNotes(noteIds)}
       />
       <EditorDrawer
         drawer={drawer}
@@ -3349,16 +3373,19 @@ function AiInsightDialog({
   onCopy,
   onAppendToNote,
   onCreateReminder,
+  onArchiveNotes,
 }: {
   insight: AiInsight | null;
   onClose: () => void;
   onCopy: (title: string, text: string) => void;
   onAppendToNote: (insight: AiInsight) => void;
   onCreateReminder: (insight: AiInsight) => void;
+  onArchiveNotes: (noteIds: number[]) => void;
 }) {
   const actions = getInsightDialogActions({
     canAppendToNote: Boolean(insight?.canAppendToNote),
     canCreateReminder: Boolean(insight?.canCreateReminder),
+    canArchiveNote: Boolean(insight?.canArchiveNote && insight.targetNoteIds?.length),
   });
   const hasExecutableActions = actions.some((action) => action.key === 'append-note' || action.key === 'create-reminder');
   return (
@@ -3411,6 +3438,10 @@ function AiInsightDialog({
                     if (action.key === 'copy') onCopy(insight.title, insight.text);
                     if (action.key === 'append-note') onAppendToNote(insight);
                     if (action.key === 'create-reminder') onCreateReminder(insight);
+                    if (action.key === 'archive-note') {
+                      onArchiveNotes(insight.targetNoteIds ?? []);
+                      return;
+                    }
                     onClose();
                   }}
                 >
