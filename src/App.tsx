@@ -1,4 +1,4 @@
-﻿import { invoke } from '@tauri-apps/api/core';
+import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { openPath } from '@tauri-apps/plugin-opener';
 import { AnimatePresence, motion, type Variants } from 'framer-motion';
@@ -15,6 +15,7 @@ import {
   buildDailyRoute,
   buildDailyReview,
   buildDailyQueue,
+  buildDailyQueueNoteStatusMap,
   dailyQueueItemKey,
   getDailyQueueItemStatus,
   summarizeDailyQueueProgress,
@@ -38,14 +39,16 @@ import {
   type DailyQueueProgress,
   type DailyQueueStatusMap,
   type DashboardStats,
+  type DailyReview,
   type NoteAttachment,
   type NoteInputDraft,
   type RepeatRulePayload,
   type ReminderDiagnostics,
   type ReminderEvent,
   type ReminderInputDraft,
+  type RiskRadarItem,
 } from './app-model';
-import { arrangeWallNotes, toLayoutPatch } from './features/sticky-wall/layout';
+import { arrangeWallNotes, toChangedLayoutPatches } from './features/sticky-wall/layout';
 import { DailyBriefDialog } from './features/daily-loop/DailyBrief';
 import { ShortcutHelp } from './features/help/ShortcutHelp';
 import { type MotionMode, motionModeLabel, nextMotionMode, shouldLoopMotion } from './features/motion/motion-mode';
@@ -55,7 +58,28 @@ import { StickyWall } from './features/sticky-wall/StickyWall';
 import type { LayoutPatch, StickyNote } from './features/sticky-wall/types';
 import type { WallExplorationMode } from './features/sticky-wall/wall-filter';
 import { getInsightDialogActions } from './insight-actions';
-
+import { buildNarrativeReviewPrompt, buildProgressAwareAiPrompt } from './constants/aiPrompts';
+import { BattleArchiveHeader, BattleGrowthPanel, BattleQuestPanel, BattleRewardsPanel } from './features/progress/BattleArchive';
+import { BattleVictoryOverlay, type BattleCelebrationState } from './features/progress/BattleVictoryOverlay';
+import { fireBattleConfetti } from './features/progress/celebration';
+import {
+  applyProgressEvent,
+  buildAchievementCards,
+  createDefaultProgress,
+  ensureDailyQuests,
+  getLevelProgress,
+  markDailyQuestComplete,
+  todayKey,
+  updateCanvasState,
+  type BattleCanvasState,
+  type BattleContext,
+  type NoteSkinId,
+  type ProgressEvent,
+  type ThemeId,
+  type UserProgress,
+} from './features/progress/progress-model';
+import { progressStore } from './stores/progressStore';
+import { resolveSelectedSkin, resolveSelectedTheme } from './theme/theme-system';
 type DrawerMode = 'note-create' | 'note-edit' | 'reminder-create' | 'reminder-edit';
 type DrawerState = { mode: DrawerMode; id?: number } | null;
 type QuickEntryMode = 'note' | 'reminder';
@@ -123,6 +147,14 @@ const metricMeta: Record<DashboardFilter, { label: string; icon: string; tone: s
   },
 };
 
+export function shouldAutoDismissToast(error: string | null, success: string | null, hasUndoAction: boolean) {
+  return !error && (Boolean(success) || hasUndoAction);
+}
+
+export function shouldClearUndoOnToastDismiss(error: string | null) {
+  return !error;
+}
+
 export default function App() {
   const [notes, setNotes] = useState<StickyNote[]>([]);
   const [reminders, setReminders] = useState<BackendReminder[]>([]);
@@ -147,6 +179,9 @@ export default function App() {
   const [aiInsight, setAiInsight] = useState<AiInsight | null>(null);
   const [alarm, setAlarm] = useState<ReminderFiredPayload | null>(null);
   const [celebration, setCelebration] = useState<string | null>(null);
+  const [battleCelebration, setBattleCelebration] = useState<BattleCelebrationState>(null);
+  const [progress, setProgress] = useState<UserProgress>(() => createDefaultProgress(todayKey()));
+  const [progressReady, setProgressReady] = useState(false);
   const [undoAction, setUndoAction] = useState<UndoAction | null>(null);
   const [createdNoteId, setCreatedNoteId] = useState<number | null>(null);
   const [arranging, setArranging] = useState(false);
@@ -161,6 +196,7 @@ export default function App() {
   const [noteDraft, setNoteDraft] = useState<NoteInputDraft>(() => emptyNoteDraft());
   const [reminderDraft, setReminderDraft] = useState<ReminderInputDraft>(() => emptyReminderDraft());
   const canvasMeasureRef = useRef<HTMLDivElement>(null);
+  const arrangingRef = useRef(false);
   const alarmedReminderIds = useRef<Set<number>>(new Set());
   const [canvasWidth, setCanvasWidth] = useState(960);
 
@@ -192,10 +228,129 @@ export default function App() {
     () => summarizeDailyQueueProgress(dailyQueue, dailyQueueStatuses),
     [dailyQueue, dailyQueueStatuses],
   );
+  const dailyQueueNoteStatuses = useMemo(
+    () => buildDailyQueueNoteStatusMap(dailyQueue, dailyQueueStatuses),
+    [dailyQueue, dailyQueueStatuses],
+  );
   const riskRadar = useMemo(() => buildRiskRadar(notes, reminders), [notes, reminders]);
   const nextReminder = visibleReminders[0];
   const selectedWallNotes = useMemo(() => notes.filter((note) => selectedIds.has(note.id)), [notes, selectedIds]);
+  const battleContext = useMemo<BattleContext>(() => {
+    const today = todayKey();
+    return {
+      today,
+      focusScore: stats.focusScore,
+      delayDebt: stats.delayDebt,
+      dailyQueueTotal: dailyQueueProgress.total,
+      dailyQueueDone: dailyQueueProgress.done,
+      dailyQueueSkipped: dailyQueueProgress.skipped,
+      notesCreatedToday: notes.filter((note) => isSameLocalDay(note.createdAt, new Date())).length,
+      archivedCount: 0,
+      bugFixedCount: 0,
+    };
+  }, [dailyQueueProgress.done, dailyQueueProgress.skipped, dailyQueueProgress.total, notes, stats.delayDebt, stats.focusScore]);
+  const levelProgress = useMemo(() => getLevelProgress(progress), [progress]);
+  const achievementCards = useMemo(() => buildAchievementCards(progress, battleContext), [battleContext, progress]);
+  const activeTheme = useMemo(
+    () => resolveSelectedTheme(progress.settings.selectedTheme, progress.unlockedThemes),
+    [progress.settings.selectedTheme, progress.unlockedThemes],
+  );
+  const activeSkin = useMemo(
+    () => resolveSelectedSkin(progress.settings.selectedSkin, progress.unlockedSkins),
+    [progress.settings.selectedSkin, progress.unlockedSkins],
+  );
+  function showProgressCelebration(state: BattleCelebrationState, intense = false) {
+    if (!state) return;
+    if (!progress.settings.reducedCelebrations) {
+      fireBattleConfetti(intense);
+    }
+    setBattleCelebration(state);
+    window.setTimeout(() => setBattleCelebration(null), 1900);
+  }
 
+  function recordProgressEvent(event: ProgressEvent, contextPatch: Partial<BattleContext> = {}) {
+    const context = { ...battleContext, ...contextPatch };
+    setProgress((current) => {
+      const result = applyProgressEvent(current, event, context);
+      const next = ensureDailyQuests(result.progress, context);
+      const unlockedNames = result.celebration.unlockedAchievements
+        .map((achievement) => achievement.name)
+        .join('、');
+      if (result.celebration.xpGained > 0 || result.celebration.levelUp || unlockedNames) {
+        window.setTimeout(
+          () =>
+            showProgressCelebration(
+              {
+                title: result.celebration.levelUp ? `Lv.${next.level} 指挥官升级` : '战役胜利',
+                detail: unlockedNames || result.celebration.message,
+                xp: result.celebration.xpGained,
+              },
+              result.celebration.levelUp || result.celebration.unlockedAchievements.length > 0,
+            ),
+          0,
+        );
+      }
+      return next;
+    });
+  }
+
+  function completeBattleQuest(questId: string) {
+    setProgress((current) => {
+      const result = markDailyQuestComplete(current, questId, battleContext);
+      if (result.celebration.xpGained > 0 || result.celebration.unlockedAchievements.length > 0) {
+        const unlockedNames = result.celebration.unlockedAchievements.map((achievement) => achievement.name).join('、');
+        window.setTimeout(
+          () =>
+            showProgressCelebration(
+              {
+                title: '作战任务完成',
+                detail: unlockedNames || result.celebration.message,
+                xp: result.celebration.xpGained,
+              },
+              result.celebration.unlockedAchievements.length > 0,
+            ),
+          0,
+        );
+      }
+      return ensureDailyQuests(result.progress, battleContext);
+    });
+  }
+
+  function updateBattleTheme(themeId: ThemeId) {
+    setProgress((current) => ({
+      ...current,
+      settings: { ...current.settings, selectedTheme: themeId },
+    }));
+  }
+
+  function updateBattleSkin(skinId: NoteSkinId) {
+    setProgress((current) => ({
+      ...current,
+      settings: { ...current.settings, selectedSkin: skinId },
+    }));
+  }
+
+  function toggleGamification() {
+    setProgress((current) => ({
+      ...current,
+      settings: { ...current.settings, gamificationEnabled: !current.settings.gamificationEnabled },
+    }));
+  }
+
+  function updateBattleCanvasState(patch: Partial<BattleCanvasState>) {
+    setProgress((current) => updateCanvasState(current, patch));
+  }
+
+  function resetBattleCanvasView() {
+    updateBattleCanvasState({ zoom: 1, panX: 0, panY: 0 });
+  }
+
+  function changeWallMode(mode: WallExplorationMode) {
+    setWallExplorationMode(mode);
+    if (mode === 'relationships') {
+      recordProgressEvent({ type: 'relation_viewed' });
+    }
+  }
   useEffect(() => {
     const preventDefaultContextMenu = (event: MouseEvent) => event.preventDefault();
     document.addEventListener('contextmenu', preventDefaultContextMenu);
@@ -203,8 +358,41 @@ export default function App() {
   }, []);
 
   useEffect(() => {
+    let cancelled = false;
+    progressStore
+      .load(todayKey())
+      .then((stored) => {
+        if (cancelled) return;
+        setProgress(ensureDailyQuests(stored, battleContext));
+        setProgressReady(true);
+      })
+      .catch((caught) => {
+        if (cancelled) return;
+        setProgress(ensureDailyQuests(createDefaultProgress(todayKey()), battleContext));
+        setProgressReady(true);
+        setError(`作战档案读取失败：${formatError(caught)}`);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!progressReady) return;
+    setProgress((current) => ensureDailyQuests(current, battleContext));
+  }, [battleContext.today, progressReady]);
+
+  useEffect(() => {
+    if (!progressReady) return;
+    void progressStore.save(progress).catch((caught) => {
+      setError(`作战档案保存失败：${formatError(caught)}`);
+    });
+  }, [progress, progressReady]);
+  useEffect(() => {
     void refreshData();
     const unlistenQuickAdd = listen('quick-add', () => openNoteDrawer());
+    const unlistenBattleQuests = listen('show-battle-quests', () => setSidePanelMode('center'));
+    const unlistenContinueBattle = listen('continue-battle', () => setSidePanelMode('focus'));
     const unlistenPausedChanged = listen<boolean>('paused-changed', (event) => {
       setRemindersPaused(Boolean(event.payload));
     });
@@ -220,6 +408,8 @@ export default function App() {
     return () => {
       window.clearInterval(pollTimer);
       void unlistenQuickAdd.then((dispose) => dispose());
+      void unlistenBattleQuests.then((dispose) => dispose());
+      void unlistenContinueBattle.then((dispose) => dispose());
       void unlistenPausedChanged.then((dispose) => dispose());
       void unlistenReminderFired.then((dispose) => dispose());
     };
@@ -302,10 +492,13 @@ export default function App() {
   }, [drawer]);
 
   useEffect(() => {
-    if (!success) return;
-    const timer = window.setTimeout(() => setSuccess(null), 3000);
+    if (!shouldAutoDismissToast(error, success, Boolean(undoAction))) return;
+    const timer = window.setTimeout(() => {
+      setSuccess(null);
+      setUndoAction(null);
+    }, 3000);
     return () => window.clearTimeout(timer);
-  }, [success]);
+  }, [error, success, undoAction]);
 
   useEffect(() => {
     if (!celebration) return;
@@ -327,14 +520,19 @@ export default function App() {
   }, [dailyQueueStatuses]);
 
   useEffect(() => {
-    if (loading) return;
+    if (loading || !progressReady) return;
+    if (!progress.onboardingSeen) {
+      setProgress((current) => ({ ...current, onboardingSeen: true }));
+      const timer = window.setTimeout(() => setStartupBriefOpen(true), 320);
+      return () => window.clearTimeout(timer);
+    }
     const todayKey = new Date().toISOString().slice(0, 10);
     const storageKey = `qmemo-startup-brief-${todayKey}`;
     if (window.localStorage.getItem(storageKey)) return;
     window.localStorage.setItem(storageKey, 'shown');
     const timer = window.setTimeout(() => setStartupBriefOpen(true), 450);
     return () => window.clearTimeout(timer);
-  }, [loading]);
+  }, [loading, progress.onboardingSeen, progressReady]);
 
 
   useEffect(() => {
@@ -470,6 +668,7 @@ export default function App() {
   }
 
   function setDailyQueueItemStatus(item: DailyQueueItem, status: DailyQueueItemStatus) {
+    const previous = getDailyQueueItemStatus(item, dailyQueueStatuses);
     setDailyQueueStatuses((current) => {
       const key = dailyQueueItemKey(item);
       const next = { ...current };
@@ -477,7 +676,21 @@ export default function App() {
       else next[key] = status;
       return next;
     });
-    setSuccess(status === 'done' ? '已标记完成。' : status === 'skipped' ? '已跳过，今天先别纠缠它。' : '已恢复到今日队列。');
+    if (previous !== status && (status === 'done' || status === 'skipped')) {
+      const doneDelta = (status === 'done' ? 1 : 0) - (previous === 'done' ? 1 : 0);
+      const skippedDelta = (status === 'skipped' ? 1 : 0) - (previous === 'skipped' ? 1 : 0);
+      recordProgressEvent(
+        { type: status === 'done' ? 'daily_queue_done' : 'daily_queue_skipped' },
+        {
+          dailyQueueDone: Math.max(0, dailyQueueProgress.done + doneDelta),
+          dailyQueueSkipped: Math.max(0, dailyQueueProgress.skipped + skippedDelta),
+        },
+      );
+      if (status === 'done' && item.kind === 'note' && /bug/i.test(`${item.title}\n${item.reason}`)) {
+        recordProgressEvent({ type: 'bug_note_fixed', count: 1 }, { bugFixedCount: 1 });
+      }
+    }
+    setSuccess(status === 'done' ? '已标记完成。+20 XP' : status === 'skipped' ? '已跳过，今天先别纠缠它。+5 XP' : '已恢复到今日队列。');
   }
 
   async function saveNote() {
@@ -507,6 +720,7 @@ export default function App() {
         setSelectedIds(new Set([created.id]));
         setCreatedNoteId(created.id);
         setActiveFilter('notes');
+        recordProgressEvent({ type: 'note_created' }, { notesCreatedToday: battleContext.notesCreatedToday + 1 });
         setSuccess('新便签贴好了。');
       }
       closeDrawer();
@@ -558,6 +772,7 @@ export default function App() {
         next.delete(id);
         return next;
       });
+      recordProgressEvent({ type: 'wall_cleaned', count: 1 }, { archivedCount: 1 });
     } catch (caught) {
       setError(formatError(caught));
     }
@@ -573,7 +788,8 @@ export default function App() {
       setNotes((current) => current.filter((note) => !archivedIds.has(note.id)));
       setSelectedIds(new Set());
       setUndoAction(ids.length === 1 ? { label: '便签已归档', kind: 'archive-note', id: ids[0] } : null);
-      setSuccess(ids.length === 1 ? '便签已归档。' : `${ids.length} 张便签已归档。`);
+      recordProgressEvent({ type: 'wall_cleaned', count: ids.length }, { archivedCount: ids.length });
+      setSuccess(ids.length === 1 ? '便签已归档。+8 XP' : `${ids.length} 张便签已归档。+${Math.min(ids.length * 8, 80)} XP`);
     } catch (caught) {
       setError(formatError(caught));
     }
@@ -591,7 +807,8 @@ export default function App() {
       setSelectedIds((current) => new Set([...current].filter((id) => !archivedIds.has(id))));
       setUndoAction(ids.length === 1 ? { label: '便签已归档', kind: 'archive-note', id: ids[0] } : null);
       setAiInsight(null);
-      setSuccess(ids.length === 1 ? '便签已归档。' : `${ids.length} 张便签已归档。`);
+      recordProgressEvent({ type: 'wall_cleaned', count: ids.length }, { archivedCount: ids.length });
+      setSuccess(ids.length === 1 ? '便签已归档。+8 XP' : `${ids.length} 张便签已归档。+${Math.min(ids.length * 8, 80)} XP`);
     } catch (caught) {
       setError(formatError(caught));
     } finally {
@@ -678,8 +895,10 @@ export default function App() {
   }
 
   async function arrangeSelectedNotes() {
+    if (arrangingRef.current) return;
     const selectedNotes = focusWallNotes.filter((note) => selectedIds.has(note.id));
     if (selectedNotes.length <= 1) return;
+    arrangingRef.current = true;
     setArranging(true);
     try {
       const arranged = arrangeWallNotes(selectedNotes, {
@@ -688,14 +907,25 @@ export default function App() {
         startX: 24,
         startY: 24,
       });
+      const layoutPatches = toChangedLayoutPatches(selectedNotes, arranged);
+      if (layoutPatches.length === 0) {
+        resetBattleCanvasView();
+        setSuccess(`${selectedNotes.length} 张选中便签已经整齐，未重复获得 XP。`);
+        return;
+      }
       const arrangedById = new Map(arranged.map((note) => [note.id, note]));
       setNotes((current) => current.map((note) => arrangedById.get(note.id) ?? note));
-      await persistLayouts(arranged.map(toLayoutPatch));
-      setSuccess(`${selectedNotes.length} 张选中便签已整理。`);
+      await persistLayouts(layoutPatches);
+      resetBattleCanvasView();
+      recordProgressEvent({ type: 'wall_arranged' });
+      setSuccess(`${selectedNotes.length} 张选中便签已整理。+10 XP`);
     } catch (caught) {
       setError(formatError(caught));
     } finally {
-      window.setTimeout(() => setArranging(false), 900);
+      window.setTimeout(() => {
+        arrangingRef.current = false;
+        setArranging(false);
+      }, 900);
     }
   }
   async function setReminderPriority(reminder: BackendReminder, priority: 'normal' | 'high') {
@@ -755,7 +985,8 @@ export default function App() {
       setActiveFilter('reminders');
       setSidePanelMode('center');
       setUndoAction({ label: '便签已转为提醒', kind: 'archive-note', id: note.id });
-      setSuccess('便签已经转成提醒，本小姐会盯时间。');
+      recordProgressEvent({ type: 'converted_item' });
+      setSuccess('便签已经转成提醒，本小姐会盯时间。+5 XP');
     } catch (caught) {
       setError(formatError(caught));
     } finally {
@@ -783,7 +1014,8 @@ export default function App() {
       setCreatedNoteId(created.id);
       setActiveFilter('notes');
       setUndoAction({ label: '提醒已转为便签', kind: 'archive-reminder', id: reminder.id });
-      setSuccess('提醒已经转成便签，信息收好了。');
+      recordProgressEvent({ type: 'converted_item' });
+      setSuccess('提醒已经转成便签，信息收好了。+5 XP');
     } catch (caught) {
       setError(formatError(caught));
     } finally {
@@ -825,21 +1057,45 @@ export default function App() {
   }
 
   async function arrangeVisibleNotes() {
+    if (arrangingRef.current) return;
+    if (focusWallNotes.length <= 1) {
+      resetBattleCanvasView();
+      setSuccess(focusWallNotes.length === 0 ? '墙面还没有便签可整理。' : '只有一张便签，视角已回正，未获得 XP。');
+      return;
+    }
+    arrangingRef.current = true;
     setArranging(true);
-    const arranged = arrangeWallNotes(focusWallNotes, {
-      containerWidth: Math.max(320, canvasWidth - 8),
-      gap: 24,
-      startX: 24,
-      startY: 24,
-    });
-    const arrangedById = new Map(arranged.map((note) => [note.id, note]));
-    setNotes((current) => current.map((note) => arrangedById.get(note.id) ?? note));
-    await persistLayouts(arranged.map(toLayoutPatch));
-    window.setTimeout(() => setArranging(false), 900);
-    setSuccess('便签墙整理好了，乱糟糟退散。');
+    try {
+      const arranged = arrangeWallNotes(focusWallNotes, {
+        containerWidth: Math.max(320, canvasWidth - 8),
+        gap: 24,
+        startX: 24,
+        startY: 24,
+      });
+      const layoutPatches = toChangedLayoutPatches(focusWallNotes, arranged);
+      if (layoutPatches.length === 0) {
+        resetBattleCanvasView();
+        setSuccess('便签墙已经整齐，视角已回正，未重复获得 XP。');
+        return;
+      }
+      const arrangedById = new Map(arranged.map((note) => [note.id, note]));
+      setNotes((current) => current.map((note) => arrangedById.get(note.id) ?? note));
+      await persistLayouts(layoutPatches);
+      resetBattleCanvasView();
+      recordProgressEvent({ type: 'wall_arranged' });
+      setSuccess('便签墙整理好了，乱糟糟退散。+10 XP');
+    } catch (caught) {
+      setError(formatError(caught));
+    } finally {
+      window.setTimeout(() => {
+        arrangingRef.current = false;
+        setArranging(false);
+      }, 900);
+    }
   }
 
   function showCleanupSuggestions() {
+    recordProgressEvent({ type: 'ai_commander_used' });
     const suggestions = buildWallCleanupSuggestions(notes);
     if (suggestions.length === 0) {
       setAiInsight({
@@ -897,6 +1153,7 @@ export default function App() {
         setSelectedIds(new Set([created.id]));
         setCreatedNoteId(created.id);
         setActiveFilter('notes');
+        recordProgressEvent({ type: 'note_created' }, { notesCreatedToday: battleContext.notesCreatedToday + 1 });
         setSuccess(parsed.reason ?? (generated.source === 'ai' ? 'AI 已生成标题并贴好便签。' : '便签贴好了，标题用了本地规则。'));
       } else {
         const draft = buildQuickReminderDraft(parsed.content, generated.title);
@@ -957,6 +1214,7 @@ export default function App() {
       setSelectedIds(new Set([created.id]));
       setCreatedNoteId(created.id);
       setActiveFilter('notes');
+      recordProgressEvent({ type: 'note_created' }, { notesCreatedToday: battleContext.notesCreatedToday + 1 });
       setSuccess('AI 结果已经保存成便签。');
     } catch (caught) {
       setError(formatError(caught));
@@ -966,7 +1224,23 @@ export default function App() {
   }
 
   async function runGlobalAi(mode: Extract<AiAssistMode, 'summary' | 'dailyRoast' | 'organize'>) {
-    const content = buildWorkspacePrompt(notes, reminders);
+    const workspacePrompt = buildWorkspacePrompt(notes, reminders);
+    const content =
+      mode === 'summary'
+        ? buildNarrativeReviewPrompt({
+            level: progress.level,
+            xp: progress.xp,
+            focusScore: stats.focusScore,
+            delayDebt: stats.delayDebt,
+            completed: dailyQueueProgress.done,
+            capturedIdeas: battleContext.notesCreatedToday,
+            cleanliness: stats.cleanliness,
+            tomorrowHint: dailyRoute[0] ?? '先挑一张便签推进。',
+          })
+        : buildProgressAwareAiPrompt(mode === 'organize' ? 'organize' : 'summary', workspacePrompt, {
+            level: progress.level,
+            achievements: progress.achievements,
+          });
     setAiBusy(mode);
     setError(null);
     try {
@@ -976,6 +1250,7 @@ export default function App() {
         text: result.text,
         source: result.source,
       });
+      recordProgressEvent({ type: 'ai_commander_used' });
       setSuccess(mode === 'summary' ? '今日总结已生成。' : mode === 'dailyRoast' ? '毒舌模式已开麦。' : 'AI 整理建议已生成。');
     } catch (caught) {
       setError(formatError(caught));
@@ -988,7 +1263,11 @@ export default function App() {
     const explicitIds = noteIds ? new Set(noteIds) : selectedIds;
     const selectedNotes = notes.filter((note) => explicitIds.has(note.id));
     const sourceNotes = selectedNotes.length > 0 ? selectedNotes : notes.slice(0, 8);
-    const prompt = buildAiNextStepPrompt(sourceNotes, selectedNotes.length > 0 ? 'selected' : 'workspace');
+    const basePrompt = buildAiNextStepPrompt(sourceNotes, selectedNotes.length > 0 ? 'selected' : 'workspace');
+    const prompt = buildProgressAwareAiPrompt('nextStep', basePrompt, {
+      level: progress.level,
+      achievements: progress.achievements,
+    });
     setAiBusy('nextStep');
     setError(null);
     try {
@@ -1002,6 +1281,7 @@ export default function App() {
         canArchiveNote: selectedNotes.length > 0,
         targetNoteIds: selectedNotes.map((note) => note.id),
       });
+      recordProgressEvent({ type: 'ai_commander_used' });
       setSuccess('AI 下一步已经生成。');
     } catch (caught) {
       setAiInsight({
@@ -1127,15 +1407,24 @@ ${note.content}`) === 'waiting').slice(0, 5);
             overdue.length ? `拖延项：${overdue.map((reminder) => reminder.title).join('、')}` : '拖延项：暂时没有，勉强夸你一句。',
             '明日建议：把等反馈事项提前确认，不要让桌面继续堆灰。',
           ];
+    const battleReport = [
+      `今日战役战报：你带队推进了 ${dailyQueueProgress.done} 个目标，俘获 ${battleContext.notesCreatedToday} 个灵感，战场肃清度 ${stats.cleanliness}%。`,
+      stats.delayDebt === 0 ? '拖延债归零，战线干净。' : `拖延债还有 ${stats.delayDebt} 点，明天先拆最小的一块。`,
+      '',
+    ].join('\n');
     setAiInsight({
-      title: kind === 'plan' ? '处理顺序' : '今日复盘',
-      text: text.join('\n'),
+      title: kind === 'plan' ? '处理顺序' : '今日战报',
+      text: kind === 'review' ? `${battleReport}${text.join('\n')}` : text.join('\n'),
       source: 'fallback',
     });
-    setSuccess(kind === 'plan' ? '处理顺序已生成。' : '今日复盘已生成。');
+    if (kind === 'review') {
+      recordProgressEvent({ type: 'ai_review_completed' });
+    }
+    setSuccess(kind === 'plan' ? '处理顺序已生成。' : '今日复盘已生成。+15 XP');
   }
 
   function showRiskRadar() {
+    recordProgressEvent({ type: 'ai_commander_used' });
     const risks = buildRiskRadar(notes, reminders);
     setAiInsight({
       title: 'AI 风险雷达',
@@ -1204,6 +1493,20 @@ ${note.content}`) === 'waiting').slice(0, 5);
         hint: 'DeepSeek 或本地兜底',
         icon: '◇',
         run: () => void runGlobalAi('summary'),
+      },
+      {
+        id: 'ai-next-step',
+        label: 'AI 生成下一步',
+        hint: '基于选中便签或全局灵感生成行动建议',
+        icon: '✓',
+        run: () => void askAiNextStepForSelection(),
+      },
+      {
+        id: 'ai-organize-insight',
+        label: 'AI 分类整理建议',
+        hint: '输出今天做、等待中、灵感分组',
+        icon: '▦',
+        run: () => void runGlobalAi('organize'),
       },
       {
         id: 'daily-plan',
@@ -1310,9 +1613,20 @@ ${note.content}`) === 'waiting').slice(0, 5);
     [focusMode, remindersPaused, notes, reminders, focusWallNotes, canvasWidth, motionMode],
   );
 
+  function dismissToast() {
+    if (error) {
+      setError(null);
+      return;
+    }
+    setSuccess(null);
+    if (shouldClearUndoOnToastDismiss(error)) {
+      setUndoAction(null);
+    }
+  }
+
   return (
-    <main className="relative h-screen overflow-x-hidden overflow-y-auto text-zinc-950">
-      <AuroraBackdrop motionMode={motionMode} />
+    <main className={`relative h-screen overflow-x-hidden overflow-y-auto text-zinc-950 ${activeTheme.rootClass}`}>
+      <AuroraBackdrop motionMode={motionMode} auraClass={activeTheme.auraClass} />
       <motion.div
         variants={pageVariants}
         initial="hidden"
@@ -1333,8 +1647,21 @@ ${note.content}`) === 'waiting').slice(0, 5);
         </motion.div>
 
         <motion.section variants={riseVariants} className="grid grid-cols-[minmax(0,1fr)_370px] gap-2.5 max-[1180px]:grid-cols-1">
-          <HeroPanel stats={stats} active={activeFilter} nextReminder={nextReminder} motionMode={motionMode} onSelect={setActiveFilter} />
-          <MetricDock stats={stats} active={activeFilter} motionMode={motionMode} onSelect={setActiveFilter} />
+          <MissionControlPanel
+            stats={stats}
+            active={activeFilter}
+            nextReminder={nextReminder}
+            motionMode={motionMode}
+            riskCount={riskRadar.length}
+            progressLabel={dailyQueueProgress.label}
+            onSelect={setActiveFilter}
+            onDailyPlan={() => showDailyBrief('plan')}
+            onRiskRadar={showRiskRadar}
+            onDailyReview={() => showDailyBrief('review')}
+            onCleanupWall={showCleanupSuggestions}
+            onOpenAiSettings={() => setAiSettingsOpen(true)}
+          />
+          <EnergyDock stats={stats} active={activeFilter} motionMode={motionMode} onSelect={setActiveFilter} />
         </motion.section>
 
         <motion.section
@@ -1375,7 +1702,12 @@ ${note.content}`) === 'waiting').slice(0, 5);
                 arranging={arranging}
                 explorationMode={wallExplorationMode}
                 challengeNoteIds={dailyQueue.highlightedNoteIds}
-                onExplorationModeChange={setWallExplorationMode}
+                dailyQueueNoteStatuses={dailyQueueNoteStatuses}
+                onExplorationModeChange={changeWallMode}
+                canvasState={progress.canvas}
+                onCanvasStateChange={updateBattleCanvasState}
+                noteSkinClass={activeSkin.cardClass}
+                noteSkinAccentClass={activeSkin.accentClass}
                 onAskAiNextStep={(noteIds) => void askAiNextStepForSelection(noteIds)}
               />
             )}
@@ -1415,6 +1747,9 @@ ${note.content}`) === 'waiting').slice(0, 5);
             recentReminders={recentReminders}
             reminderEvents={reminderEvents}
             diagnostics={diagnostics}
+            stats={stats}
+            risks={riskRadar}
+            review={dailyReview}
             activeFilter={activeFilter}
             mode={sidePanelMode}
             motionMode={motionMode}
@@ -1427,7 +1762,7 @@ ${note.content}`) === 'waiting').slice(0, 5);
             onDailyQueueItem={(item) => {
               if (item.kind === 'note') {
                 setActiveFilter('notes');
-                setWallExplorationMode('challenge');
+                changeWallMode('challenge');
                 setSelectedIds(new Set([item.id]));
                 return;
               }
@@ -1444,9 +1779,12 @@ ${note.content}`) === 'waiting').slice(0, 5);
             onOpenAiSettings={() => setAiSettingsOpen(true)}
             onDailySummary={() => void runGlobalAi('summary')}
             onDailyRoast={() => void runGlobalAi('dailyRoast')}
+            onAiNextStep={() => void askAiNextStepForSelection()}
+            onAiOrganize={() => void runGlobalAi('organize')}
             onDailyPlan={() => showDailyBrief('plan')}
             onRiskRadar={showRiskRadar}
             onDailyReview={() => showDailyBrief('review')}
+            onCleanupWall={showCleanupSuggestions}
             onTestReminder={() => void runTestReminder()}
             onExportBackup={() => void exportBackup()}
             onReminderDiagnostics={showReminderDiagnostics}
@@ -1460,6 +1798,14 @@ ${note.content}`) === 'waiting').slice(0, 5);
             onSnoozeReminder={(reminder, minutes) => void snoozeReminder(reminder, minutes)}
             onConvertReminderToNote={(reminder) => void convertReminderToNote(reminder)}
             onToggleReminderPriority={(reminder) => void setReminderPriority(reminder, reminder.priority === 'high' ? 'normal' : 'high')}
+            progress={progress}
+            levelProgress={levelProgress}
+            achievementCards={achievementCards}
+            battleContext={battleContext}
+            onCompleteBattleQuest={completeBattleQuest}
+            onThemeChange={updateBattleTheme}
+            onSkinChange={updateBattleSkin}
+            onToggleGamification={toggleGamification}
           />
         </motion.section>
       </motion.div>
@@ -1469,9 +1815,10 @@ ${note.content}`) === 'waiting').slice(0, 5);
         success={success}
         undo={undoAction}
         onUndo={() => void undoLastAction()}
-        onDismiss={() => (error ? setError(null) : setSuccess(null))}
+        onDismiss={dismissToast}
       />
       <CelebrationBurst message={celebration} />
+      <BattleVictoryOverlay celebration={battleCelebration} />
       <CommandPalette
         open={commandPaletteOpen}
         actions={commandActions}
@@ -1548,11 +1895,11 @@ ${note.content}`) === 'waiting').slice(0, 5);
   );
 }
 
-function AuroraBackdrop({ motionMode }: { motionMode: MotionMode }) {
+function AuroraBackdrop({ motionMode, auraClass }: { motionMode: MotionMode; auraClass?: string }) {
   const loopMotion = shouldLoopMotion(motionMode);
   const wildMotion = motionMode === 'wild';
   return (
-    <div className={`pointer-events-none fixed inset-0 overflow-hidden ${motionMode === 'calm' ? 'motion-calm' : ''}`}>
+    <div className={`pointer-events-none fixed inset-0 overflow-hidden ${motionMode === 'calm' ? 'motion-calm' : ''} ${auraClass ?? ''}`}>
       <motion.div
         className="aurora-blob aurora-blob-a"
         animate={loopMotion ? { x: [-18, wildMotion ? 28 : 14, -18], y: [0, wildMotion ? 18 : 8, 0], scale: [1, wildMotion ? 1.08 : 1.035, 1] } : { x: 0, y: 0, scale: 1 }}
@@ -1676,42 +2023,60 @@ function CommandIsland({
   );
 }
 
-function HeroPanel({
+function MissionControlPanel({
   stats,
   active,
   nextReminder,
   motionMode,
+  riskCount,
+  progressLabel,
   onSelect,
+  onDailyPlan,
+  onRiskRadar,
+  onDailyReview,
+  onCleanupWall,
+  onOpenAiSettings,
 }: {
-  stats: { reminders: number; highPriority: number; notes: number };
+  stats: DashboardStats;
   active: DashboardFilter;
   nextReminder?: BackendReminder;
   motionMode: MotionMode;
+  riskCount: number;
+  progressLabel: string;
   onSelect: (filter: DashboardFilter) => void;
+  onDailyPlan: () => void;
+  onRiskRadar: () => void;
+  onDailyReview: () => void;
+  onCleanupWall: () => void;
+  onOpenAiSettings: () => void;
 }) {
   const loopMotion = shouldLoopMotion(motionMode);
   const wildMotion = motionMode === 'wild';
+  const missionTone = stats.overdueReminders > 0 ? 'text-rose-500' : stats.missingNextStepNotes > 0 ? 'text-amber-600' : 'text-emerald-600';
+  const ringStyle = { background: `conic-gradient(#0ea5e9 ${stats.focusScore * 3.6}deg, rgba(15,23,42,.08) 0deg)` };
+
   return (
-    <section className="relative overflow-hidden rounded-[26px] border border-white/72 bg-white/52 p-3 shadow-[0_1px_2px_rgba(15,23,42,.04),0_16px_48px_rgba(68,83,120,.09)] backdrop-blur-2xl">
-      <div className="absolute -right-20 -top-24 h-60 w-60 rounded-full bg-sky-300/25 blur-3xl" />
-      <div className="absolute bottom-0 right-16 h-36 w-36 rounded-full bg-amber-200/35 blur-3xl" />
-      <div className="relative grid items-start grid-cols-[minmax(0,1fr)_190px] gap-3 max-[760px]:grid-cols-1">
-        <div>
-          <motion.p variants={riseVariants} className="text-xs font-semibold uppercase tracking-[.32em] text-sky-600">
-            Aurora Desk
+    <section className="relative overflow-hidden rounded-[28px] border border-white/72 bg-white/58 p-3.5 shadow-[0_1px_2px_rgba(15,23,42,.04),0_18px_56px_rgba(68,83,120,.105)] backdrop-blur-2xl">
+      <div className="pointer-events-none absolute inset-x-4 top-0 h-px bg-gradient-to-r from-transparent via-white/95 to-transparent" />
+      <div className="relative grid items-stretch gap-3 lg:grid-cols-[minmax(0,1fr)_210px_224px]">
+        <div className="min-w-0">
+          <motion.p variants={riseVariants} className="text-xs font-black uppercase tracking-[.32em] text-sky-600">
+            AI Command Desk
           </motion.p>
-          <motion.h2 variants={riseVariants} className="mt-1 max-w-2xl text-[25px] font-semibold leading-[1.03] tracking-[-.045em] text-zinc-950 max-[1360px]:text-[23px]">
-            把今天整理成一面会呼吸的灵感墙。
+          <motion.h2 variants={riseVariants} className="mt-1 max-w-2xl text-[27px] font-black leading-[1.02] tracking-[-.045em] text-zinc-950 max-[1360px]:text-[24px]">
+            今天的混乱，本小姐已经替你排成作战顺序。
           </motion.h2>
-          <motion.p variants={riseVariants} className="mt-2 max-w-xl text-[12px] font-medium leading-5 text-zinc-500">
-            便签负责承载想法，提醒负责守住时间。乱糟糟的事情交给本小姐，你只要把下一步写下来就好。
+          <motion.p variants={riseVariants} className="mt-2 max-w-2xl text-[12px] font-semibold leading-5 text-zinc-500">
+            先看战况，再推进便签，最后复盘清场。轻备忘不是纸片堆，是会催你往前走的灵感作战桌。
           </motion.p>
-          <div className="mt-2.5 flex flex-wrap gap-2">
+
+          <div className="mt-3 flex flex-wrap gap-2">
             {(['notes', 'reminders', 'highPriority'] as DashboardFilter[]).map((key) => (
               <button
                 key={key}
-                className={`rounded-full px-3.5 py-1.5 text-[13px] font-semibold transition ${
-                  active === key ? 'bg-zinc-950 text-white shadow-[0_12px_28px_rgba(15,23,42,.22)]' : 'bg-white/70 text-zinc-500 hover:bg-white hover:text-zinc-800'
+                type="button"
+                className={`rounded-full px-3.5 py-1.5 text-[13px] font-black transition ${
+                  active === key ? 'bg-zinc-950 text-white shadow-[0_12px_28px_rgba(15,23,42,.22)]' : 'bg-white/72 text-zinc-500 hover:bg-white hover:text-zinc-800'
                 }`}
                 onClick={() => onSelect(key)}
               >
@@ -1719,50 +2084,63 @@ function HeroPanel({
               </button>
             ))}
           </div>
+
+          <div className="mt-3 grid max-w-2xl grid-cols-3 gap-2 max-[760px]:grid-cols-1">
+            <MissionChip label="今日主线" value={stats.headline} toneClass={missionTone} />
+            <MissionChip label="队列进度" value={progressLabel} toneClass="text-sky-600" />
+            <MissionChip label="风险雷达" value={riskCount ? `${riskCount} 个信号` : '暂时清爽'} toneClass={riskCount ? 'text-rose-500' : 'text-emerald-600'} />
+          </div>
+        </div>
+
+        <div className="relative overflow-hidden rounded-[24px] border border-white/72 bg-white/68 p-3 shadow-[inset_0_1px_0_rgba(255,255,255,.76)]">
+          <div className="flex items-center justify-between gap-3">
+            <div>
+              <p className="text-[10px] font-black uppercase tracking-[.22em] text-zinc-400">Focus Score</p>
+              <p className="mt-1 text-sm font-black text-zinc-800">作战能量</p>
+            </div>
+            <motion.div
+              className="grid h-16 w-16 shrink-0 place-items-center rounded-full p-1"
+              style={ringStyle}
+              animate={loopMotion ? { rotate: [0, wildMotion ? 10 : 4, 0] } : { rotate: 0 }}
+              transition={{ duration: wildMotion ? 1.8 : 3.4, repeat: loopMotion ? Infinity : 0, ease: 'easeInOut' }}
+            >
+              <div className="grid h-full w-full place-items-center rounded-full bg-white text-[20px] font-black tabular-nums text-zinc-900">
+                {stats.focusScore}
+              </div>
+            </motion.div>
+          </div>
+          <div className="mt-3 grid grid-cols-3 gap-1.5 text-center">
+            <MiniMissionStat label="拖延债" value={stats.delayDebt} tone="rose" />
+            <MiniMissionStat label="转行动" value={`${stats.conversionRate}%`} tone="sky" />
+            <MiniMissionStat label="清爽度" value={`${stats.cleanliness}%`} tone="emerald" />
+          </div>
+          <p className="mt-3 text-[11px] font-semibold leading-4 text-zinc-400">
+            {nextReminder ? `下个提醒：${nextReminder.title} · ${formatReminderTime(nextReminder.next_due_at ?? nextReminder.due_at)}` : '暂无下一条提醒，可以先把一张便签转成时间。'}
+          </p>
         </div>
 
         <motion.div
-          whileHover={{ y: -8, rotate: -1.2, scale: 1.035 }}
-          className="relative h-[154px] overflow-hidden rounded-[22px] border border-white/12 bg-zinc-950 p-3.5 text-white shadow-[0_18px_44px_rgba(15,23,42,.22)]"
+          whileHover={{ y: -5, scale: 1.015 }}
+          className="relative overflow-hidden rounded-[24px] border border-zinc-950/10 bg-zinc-950 p-3.5 text-white shadow-[0_18px_44px_rgba(15,23,42,.24)]"
         >
           <motion.div
-            className="pointer-events-none absolute inset-0 bg-[radial-gradient(circle_at_20%_0%,rgba(125,211,252,.20),transparent_35%),radial-gradient(circle_at_100%_100%,rgba(196,181,253,.16),transparent_38%)]"
-            animate={loopMotion ? { opacity: [0.72, wildMotion ? 1 : 0.86, 0.72] } : { opacity: 0.72 }}
-            transition={{ duration: wildMotion ? 4.8 : 8, repeat: loopMotion ? Infinity : 0, ease: 'easeInOut' }}
-          />
-          <motion.div
-            className="pointer-events-none absolute -inset-10 rounded-full border border-sky-300/18"
-            animate={loopMotion ? { rotate: 360, scale: [1, wildMotion ? 1.28 : 1.08, 1] } : { rotate: 0, scale: 1 }}
-            transition={{ rotate: { duration: wildMotion ? 4.2 : 9, repeat: loopMotion ? Infinity : 0, ease: 'linear' }, scale: { duration: wildMotion ? 1.6 : 4, repeat: loopMotion ? Infinity : 0, ease: 'easeInOut' } }}
-          />
-          <motion.div
-            className="pointer-events-none absolute inset-y-0 -left-20 w-16 rotate-12 bg-white/18 blur-md"
-            animate={loopMotion ? { x: [-90, wildMotion ? 310 : 190] } : { x: -90, opacity: 0 }}
-            transition={{ duration: wildMotion ? 1.35 : 3.4, repeat: loopMotion ? Infinity : 0, repeatDelay: wildMotion ? 0.28 : 2, ease: 'easeInOut' }}
+            className="pointer-events-none absolute inset-y-0 -left-20 w-14 rotate-12 bg-white/18 blur-md"
+            animate={loopMotion ? { x: [-80, wildMotion ? 310 : 220] } : { x: -80, opacity: 0 }}
+            transition={{ duration: wildMotion ? 1.2 : 3.2, repeat: loopMotion ? Infinity : 0, repeatDelay: wildMotion ? 0.25 : 1.6, ease: 'easeInOut' }}
           />
           <div className="relative">
-          <p className="text-xs font-semibold uppercase tracking-[.26em] text-white/45">Next</p>
-          {nextReminder ? (
-            <div className="mt-3">
-              <p className="line-clamp-1 text-base font-semibold leading-snug">{nextReminder.title}</p>
-              <p className="mt-2 text-xs font-medium text-white/55">{formatReminderTime(nextReminder.next_due_at ?? nextReminder.due_at)}</p>
-              <p className="mt-2 line-clamp-2 text-[12px] leading-5 text-white/70">{nextReminder.notes || '没有备注，但本小姐会准时提醒。'}</p>
+            <p className="text-xs font-black uppercase tracking-[.26em] text-white/45">AI Commander</p>
+            <h3 className="mt-2 text-xl font-black tracking-[-.035em]">一键接管今天</h3>
+            <p className="mt-1.5 text-[12px] font-semibold leading-5 text-white/58">让 AI 先排顺序、扫风险、清墙面，再把结果变成动作。</p>
+            <div className="mt-3 grid grid-cols-2 gap-2">
+              <CommanderButton label="作战计划" onClick={onDailyPlan} primary />
+              <CommanderButton label="扫风险" onClick={onRiskRadar} />
+              <CommanderButton label="清墙面" onClick={onCleanupWall} />
+              <CommanderButton label="复盘" onClick={onDailyReview} />
             </div>
-          ) : (
-            <div className="mt-5">
-              <p className="text-lg font-semibold leading-snug">暂无提醒</p>
-              <p className="mt-3 text-sm leading-6 text-white/60">新增一条，本小姐替你盯时间。</p>
-            </div>
-          )}
-          <div className="mt-2.5 h-1.5 overflow-hidden rounded-full bg-white/10">
-            <motion.div
-              className="h-full rounded-full bg-gradient-to-r from-sky-300 to-violet-300"
-              initial={{ width: '18%' }}
-              animate={loopMotion ? { width: ['12%', wildMotion ? '96%' : '62%', '36%'] } : { width: '36%' }}
-              transition={{ duration: wildMotion ? 2.6 : 5, repeat: loopMotion ? Infinity : 0, ease: 'easeInOut' }}
-            />
-          </div>
-          <p className="mt-2 text-[11px] font-medium text-white/35">今日节奏 · {stats.notes} 张便签 / {stats.reminders} 条提醒</p>
+            <button type="button" className="mt-2 w-full rounded-2xl border border-white/10 bg-white/8 px-3 py-2 text-xs font-black text-white/72 transition hover:bg-white/14 hover:text-white" onClick={onOpenAiSettings}>
+              AI 设置
+            </button>
           </div>
         </motion.div>
       </div>
@@ -1770,67 +2148,98 @@ function HeroPanel({
   );
 }
 
-function MetricDock({
+function MissionChip({ label, value, toneClass }: { label: string; value: string; toneClass: string }) {
+  return (
+    <div className="min-w-0 rounded-2xl border border-white/72 bg-white/58 px-3 py-2 shadow-sm">
+      <p className="text-[10px] font-black uppercase tracking-[.16em] text-zinc-400">{label}</p>
+      <p className={`mt-1 truncate text-xs font-black ${toneClass}`} title={value}>{value}</p>
+    </div>
+  );
+}
+
+function MiniMissionStat({ label, value, tone }: { label: string; value: number | string; tone: 'rose' | 'sky' | 'emerald' }) {
+  const toneClass = {
+    rose: 'text-rose-500 bg-rose-50/72',
+    sky: 'text-sky-600 bg-sky-50/72',
+    emerald: 'text-emerald-600 bg-emerald-50/72',
+  }[tone];
+  return (
+    <div className={`rounded-2xl px-2 py-2 ${toneClass}`}>
+      <p className="text-[10px] font-black opacity-65">{label}</p>
+      <p className="mt-1 text-sm font-black tabular-nums">{value}</p>
+    </div>
+  );
+}
+
+function CommanderButton({ label, primary = false, onClick }: { label: string; primary?: boolean; onClick: () => void }) {
+  return (
+    <button
+      type="button"
+      className={primary
+        ? 'rounded-2xl bg-white px-3 py-2 text-xs font-black text-zinc-950 shadow-[0_12px_28px_rgba(255,255,255,.12)] transition hover:-translate-y-0.5'
+        : 'rounded-2xl border border-white/10 bg-white/8 px-3 py-2 text-xs font-black text-white/72 transition hover:-translate-y-0.5 hover:bg-white/14 hover:text-white'}
+      onClick={onClick}
+    >
+      {label}
+    </button>
+  );
+}
+
+function EnergyDock({
   stats,
   active,
   motionMode,
   onSelect,
 }: {
-  stats: { reminders: number; highPriority: number; notes: number };
+  stats: DashboardStats;
   active: DashboardFilter;
   motionMode: MotionMode;
   onSelect: (filter: DashboardFilter) => void;
 }) {
   const loopMotion = shouldLoopMotion(motionMode);
   const wildMotion = motionMode === 'wild';
-  const entries: Array<[DashboardFilter, number]> = [
-    ['notes', stats.notes],
-    ['reminders', stats.reminders],
-    ['highPriority', stats.highPriority],
+  const entries: Array<{ key: string; label: string; value: number | string; hint: string; tone: string; filter?: DashboardFilter }> = [
+    { key: 'notes', label: '灵感', value: stats.notes, hint: '墙面库存', tone: 'from-sky-500 to-cyan-400', filter: 'notes' },
+    { key: 'reminders', label: '时间', value: stats.reminders, hint: '待提醒', tone: 'from-amber-400 to-orange-500', filter: 'reminders' },
+    { key: 'highPriority', label: '重点', value: stats.highPriority, hint: '别装没看见', tone: 'from-rose-500 to-pink-400', filter: 'highPriority' },
+    { key: 'delayDebt', label: '拖延债', value: stats.delayDebt, hint: `${stats.overdueReminders} 过期 / ${stats.waitingNotes} 等反馈`, tone: 'from-fuchsia-500 to-rose-500', filter: 'reminders' },
+    { key: 'conversionRate', label: '转行动', value: `${stats.conversionRate}%`, hint: `${stats.missingNextStepNotes} 张缺下一步`, tone: 'from-violet-500 to-sky-500', filter: 'notes' },
+    { key: 'cleanliness', label: '清爽度', value: `${stats.cleanliness}%`, hint: '可归档/重复越少越高', tone: 'from-emerald-400 to-teal-500', filter: 'notes' },
   ];
 
   return (
-    <section className="grid grid-cols-3 gap-2.5 max-[1180px]:grid-cols-3">
-      {entries.map(([key, value], index) => {
-        const meta = metricMeta[key];
+    <section className="grid grid-cols-2 gap-2.5 max-[1180px]:grid-cols-3 max-[680px]:grid-cols-2">
+      {entries.map((entry, index) => {
+        const selected = entry.filter && active === entry.filter && ['notes', 'reminders', 'highPriority'].includes(entry.key);
         return (
           <motion.button
-            key={key}
+            key={entry.key}
+            type="button"
             variants={riseVariants}
             custom={index}
-            whileHover={{ y: motionMode === 'calm' ? -4 : wildMotion ? -16 : -8, rotate: motionMode === 'calm' ? 0 : index === 1 ? 3.5 : -3.5, scale: motionMode === 'calm' ? 1.02 : wildMotion ? 1.09 : 1.045 }}
+            whileHover={{ y: motionMode === 'calm' ? -3 : wildMotion ? -10 : -5, scale: motionMode === 'calm' ? 1.01 : 1.035 }}
             whileTap={{ scale: 0.98 }}
-            animate={loopMotion ? {
-              y: active === key ? [0, wildMotion ? -16 : -7, 0] : [0, wildMotion ? -7 - index : -3, 0],
-              scale: active === key ? [1, wildMotion ? 1.075 : 1.025, 1] : [1, wildMotion ? 1.035 : 1.012, 1],
-            } : { y: 0, scale: 1 }}
-            transition={{ duration: wildMotion ? 1.85 + index * 0.18 : 3.4 + index * 0.22, repeat: loopMotion ? Infinity : 0, ease: 'easeInOut' }}
-            className={`group relative min-h-[154px] overflow-hidden rounded-[24px] border p-3 text-left backdrop-blur-2xl transition before:pointer-events-none before:absolute before:inset-x-4 before:top-0 before:h-px before:bg-gradient-to-r before:from-transparent before:via-white/95 before:to-transparent ${
-              active === key
-                ? 'border-white/85 bg-white/82 shadow-[0_1px_2px_rgba(15,23,42,.04),0_28px_68px_rgba(59,130,246,.18)]'
-                : 'border-white/70 bg-white/46 shadow-[0_1px_2px_rgba(15,23,42,.04),0_20px_58px_rgba(68,83,120,.10)] hover:bg-white/68'
+            animate={loopMotion ? { y: [0, selected ? -5 : -2, 0] } : { y: 0 }}
+            transition={{ duration: wildMotion ? 1.6 + index * 0.08 : 3.2 + index * 0.12, repeat: loopMotion ? Infinity : 0, ease: 'easeInOut' }}
+            className={`group relative min-h-[72px] overflow-hidden rounded-[22px] border p-3 text-left backdrop-blur-2xl transition ${
+              selected ? 'border-white/85 bg-white/86 shadow-[0_18px_42px_rgba(59,130,246,.16)]' : 'border-white/70 bg-white/52 shadow-[0_1px_2px_rgba(15,23,42,.04),0_12px_32px_rgba(68,83,120,.075)] hover:bg-white/72'
             }`}
-            onClick={() => onSelect(key)}
+            onClick={() => entry.filter && onSelect(entry.filter)}
           >
-            <div className={`absolute -right-10 -top-10 h-28 w-28 rounded-full bg-gradient-to-br ${meta.tone} opacity-20 blur-2xl transition group-hover:opacity-35`} />
-            <motion.div
-              className={`grid h-9 w-9 place-items-center rounded-2xl bg-gradient-to-br ${meta.tone} text-base text-white shadow-lg ${meta.glow}`}
-              animate={loopMotion ? { rotate: active === key ? [0, wildMotion ? -24 : -8, wildMotion ? 24 : 8, 0] : [0, wildMotion ? 18 : 5, 0], y: active === key ? [0, wildMotion ? -7 : -3, 0] : [0, wildMotion ? -5 : -2, 0] } : { rotate: 0, y: 0 }}
-              transition={{ duration: wildMotion ? 1.35 : 3, repeat: loopMotion ? Infinity : 0, ease: 'easeInOut' }}
-            >
-              {meta.icon}
-            </motion.div>
-            <p className="mt-3 text-[12px] font-semibold text-zinc-500">{meta.label}</p>
-            <motion.p layout className="mt-1 text-[28px] font-semibold leading-none tracking-[-.04em] tabular-nums">
-              {value}
-            </motion.p>
+            <div className={`absolute inset-x-3 top-0 h-1 rounded-full bg-gradient-to-r ${entry.tone} opacity-70 transition group-hover:opacity-100`} />
+            <div className="relative flex items-start justify-between gap-2">
+              <div className="min-w-0">
+                <p className="text-[11px] font-black text-zinc-500">{entry.label}</p>
+                <p className="mt-1 truncate text-[10px] font-semibold text-zinc-400">{entry.hint}</p>
+              </div>
+              <p className="text-[22px] font-black leading-none tracking-[-.04em] tabular-nums text-zinc-950">{entry.value}</p>
+            </div>
           </motion.button>
         );
       })}
     </section>
   );
 }
-
 function CanvasStage({
   count,
   activeFilter,
@@ -1892,6 +2301,9 @@ function FocusRail({
   recentReminders,
   reminderEvents,
   diagnostics,
+  stats,
+  risks,
+  review,
   activeFilter,
   mode,
   motionMode,
@@ -1908,9 +2320,12 @@ function FocusRail({
   onOpenAiSettings,
   onDailySummary,
   onDailyRoast,
+  onAiNextStep,
+  onAiOrganize,
   onDailyPlan,
   onRiskRadar,
   onDailyReview,
+  onCleanupWall,
   onTestReminder,
   onExportBackup,
   onReminderDiagnostics,
@@ -1924,12 +2339,23 @@ function FocusRail({
   onSnoozeReminder,
   onConvertReminderToNote,
   onToggleReminderPriority,
+  progress,
+  levelProgress,
+  achievementCards,
+  battleContext,
+  onCompleteBattleQuest,
+  onThemeChange,
+  onSkinChange,
+  onToggleGamification,
 }: {
   loading: boolean;
   reminders: BackendReminder[];
   recentReminders: BackendReminder[];
   reminderEvents: ReminderEvent[];
   diagnostics: ReminderDiagnostics | null;
+  stats: DashboardStats;
+  risks: RiskRadarItem[];
+  review: DailyReview;
   activeFilter: DashboardFilter;
   mode: SidePanelMode;
   motionMode: MotionMode;
@@ -1946,9 +2372,12 @@ function FocusRail({
   onOpenAiSettings: () => void;
   onDailySummary: () => void;
   onDailyRoast: () => void;
+  onAiNextStep: () => void;
+  onAiOrganize: () => void;
   onDailyPlan: () => void;
   onRiskRadar: () => void;
   onDailyReview: () => void;
+  onCleanupWall: () => void;
   onTestReminder: () => void;
   onExportBackup: () => void;
   onReminderDiagnostics: () => void;
@@ -1962,69 +2391,69 @@ function FocusRail({
   onSnoozeReminder: (reminder: BackendReminder, minutes: number) => void;
   onConvertReminderToNote: (reminder: BackendReminder) => void;
   onToggleReminderPriority: (reminder: BackendReminder) => void;
+  progress: UserProgress;
+  levelProgress: ReturnType<typeof getLevelProgress>;
+  achievementCards: ReturnType<typeof buildAchievementCards>;
+  battleContext: BattleContext;
+  onCompleteBattleQuest: (questId: string) => void;
+  onThemeChange: (themeId: ThemeId) => void;
+  onSkinChange: (skinId: NoteSkinId) => void;
+  onToggleGamification: () => void;
 }) {
+  const tabs: Array<{ key: SidePanelMode; label: string; icon: string }> = [
+    { key: 'focus', label: '今日战报', icon: '✦' },
+    { key: 'center', label: '成就奖励', icon: '◇' },
+    { key: 'timeline', label: '数据成长', icon: '◷' },
+  ];
+
   return (
     <aside className="flex min-h-0 flex-col gap-2.5">
-      <section className="rounded-[26px] border border-white/72 bg-white/58 p-3 shadow-[0_1px_2px_rgba(15,23,42,.04),0_18px_52px_rgba(68,83,120,.095)] backdrop-blur-2xl">
-        <div className="mb-2.5 flex items-start justify-between gap-3 px-1">
-          <div>
-            <p className="text-[10px] font-black uppercase tracking-[.28em] text-sky-600">Today</p>
-            <h2 className="mt-0.5 text-base font-semibold">{dailyQueue.title}</h2>
-            <p className="mt-0.5 text-[11px] font-semibold text-zinc-400">{dailyQueue.subtitle}</p>
+      <div className="shrink-0 space-y-2.5">
+        <section className="rounded-[26px] border border-white/72 bg-white/58 p-3 shadow-[0_1px_2px_rgba(15,23,42,.04),0_18px_52px_rgba(68,83,120,.095)] backdrop-blur-2xl">
+          <div className="mb-2 flex items-start justify-between gap-3 px-1">
+            <div className="min-w-0">
+              <p className="text-[10px] font-black uppercase tracking-[.28em] text-sky-600">Today Queue</p>
+              <h2 className="mt-0.5 truncate text-base font-black text-zinc-950">{dailyQueue.title}</h2>
+              <p className="mt-0.5 line-clamp-1 text-[11px] font-semibold text-zinc-400">{dailyQueue.subtitle}</p>
+            </div>
+            <span className="shrink-0 rounded-full bg-zinc-950 px-2.5 py-1 text-[11px] font-black text-white shadow-[0_10px_22px_rgba(15,23,42,.16)]">{dailyQueueProgress.label}</span>
           </div>
-          <span className="rounded-full bg-zinc-950 px-2.5 py-1 text-[11px] font-black text-white shadow-[0_10px_22px_rgba(15,23,42,.16)]">{dailyQueueProgress.label}</span>
-        </div>
-        <div className="space-y-2">
-          {dailyQueue.items.map((item, index) => {
-            const status = getDailyQueueItemStatus(item, dailyQueueStatuses);
-            return (
-              <DailyQueueButton
-                key={`${item.kind}-${item.id}`}
-                item={item}
-                index={index}
-                status={status}
-                onClick={() => onDailyQueueItem(item)}
-                onDone={() => onSetDailyQueueItemStatus(item, 'done')}
-                onSkip={() => onSetDailyQueueItemStatus(item, 'skipped')}
-                onRestore={() => onSetDailyQueueItemStatus(item, 'open')}
-              />
-            );
-          })}
-        </div>
-        <div className="mt-3 grid grid-cols-4 gap-1.5">
-          <RailMiniAction title={aiBusy === 'summary' ? '分析中' : '概览'} icon="☀" onClick={onDailySummary} />
-          <RailMiniAction title="先做" icon="☑" onClick={onDailyPlan} />
-          <RailMiniAction title="风险" icon="⚠" onClick={onRiskRadar} />
-          <RailMiniAction title="复盘" icon="↺" onClick={onDailyReview} />
-        </div>
-        <div className="mt-2 grid grid-cols-4 gap-1.5 border-t border-white/62 pt-2">
-          <RailToolAction title="统计" onClick={() => onModeChange('center')} />
-          <RailToolAction title="历史" onClick={() => onModeChange('timeline')} />
-          <RailToolAction title="诊断" onClick={onReminderDiagnostics} />
-          <RailToolAction title="备份" onClick={onExportBackup} />
-        </div>
-      </section>
-      <section className="rounded-[26px] border border-white/72 bg-white/54 p-2 shadow-[0_1px_2px_rgba(15,23,42,.04),0_18px_52px_rgba(68,83,120,.095)] backdrop-blur-2xl">
-        <div className="grid grid-cols-3 gap-1">
-          {([
-            ['focus', '专注', '✦'],
-            ['center', '中心', '◷'],
-            ['timeline', '时间线', '☀'],
-          ] as Array<[SidePanelMode, string, string]>).map(([key, label, icon]) => (
-            <button
-              key={key}
-              className={`rounded-2xl px-3 py-2 text-xs font-black transition ${
-                mode === key
-                  ? 'bg-zinc-950 text-white shadow-[0_12px_26px_rgba(15,23,42,.20)]'
-                  : 'text-zinc-400 hover:bg-white/70 hover:text-zinc-700'
-              }`}
-              onClick={() => onModeChange(key)}
-            >
-              {icon} {label}
-            </button>
-          ))}
-        </div>
-      </section>
+          <div className="space-y-1.5">
+            {dailyQueue.items.slice(0, 3).map((item, index) => {
+              const status = getDailyQueueItemStatus(item, dailyQueueStatuses);
+              return (
+                <DailyQueueCompactItem
+                  key={`${item.kind}-${item.id}`}
+                  item={item}
+                  index={index}
+                  status={status}
+                  onClick={() => onDailyQueueItem(item)}
+                  onDone={() => onSetDailyQueueItemStatus(item, 'done')}
+                  onRestore={() => onSetDailyQueueItemStatus(item, 'open')}
+                />
+              );
+            })}
+          </div>
+        </section>
+        <BattleArchiveHeader progress={progress} levelProgress={levelProgress} achievements={achievementCards} />
+        <section className="rounded-[24px] border border-white/72 bg-white/54 p-2 shadow-[0_1px_2px_rgba(15,23,42,.04),0_14px_34px_rgba(68,83,120,.08)] backdrop-blur-2xl">
+          <div className="grid grid-cols-3 gap-1">
+            {tabs.map((tab) => (
+              <button
+                key={tab.key}
+                className={`rounded-2xl px-2 py-2 text-[11px] font-black transition ${
+                  mode === tab.key
+                    ? 'bg-zinc-950 text-white shadow-[0_12px_26px_rgba(15,23,42,.20)]'
+                    : 'text-zinc-400 hover:bg-white/70 hover:text-zinc-700'
+                }`}
+                onClick={() => onModeChange(tab.key)}
+              >
+                {tab.icon} {tab.label}
+              </button>
+            ))}
+          </div>
+        </section>
+      </div>
 
       <AnimatePresence mode="wait">
         <motion.div
@@ -2036,66 +2465,79 @@ function FocusRail({
           transition={{ type: 'spring', stiffness: 360, damping: 30 }}
         >
           {mode === 'focus' && (
-            <section className="flex h-full min-h-0 flex-col overflow-hidden rounded-[26px] border border-white/72 bg-white/54 p-3.5 shadow-[0_1px_2px_rgba(15,23,42,.04),0_18px_52px_rgba(68,83,120,.095)] backdrop-blur-2xl">
-              <div className="mb-2 flex items-center justify-between px-1">
-                <div>
-                  <p className="text-xs font-semibold uppercase tracking-[.26em] text-sky-600">Focus</p>
-                  <h2 className="mt-0.5 text-lg font-semibold tracking-[-.02em]">
-                    {activeFilter === 'highPriority' ? '高优先级提醒' : '提醒流'}
-                  </h2>
-                </div>
-                <button className="rounded-full bg-zinc-950 px-3.5 py-2 text-xs font-semibold text-white shadow-lg" onClick={onCreateReminder}>
-                  + 新增
-                </button>
-              </div>
-              <ReminderList
-                loading={loading}
-                reminders={reminders}
-                diagnostics={diagnostics}
-                onSnooze={onSnoozeReminder}
-                onEdit={onEditReminder}
-                onComplete={onCompleteReminder}
-                onArchive={onArchiveReminder}
-                onConvertToNote={onConvertReminderToNote}
-                onTogglePriority={onToggleReminderPriority}
-              />
-            </section>
-          )}
-          {mode === 'center' && (
-            <ReminderCenter
+            <BattleTodayReportPanel
+              loading={loading}
               reminders={reminders}
-              recentReminders={recentReminders}
-              reminderEvents={reminderEvents}
               diagnostics={diagnostics}
-              focusMode={focusMode}
-              remindersPaused={remindersPaused}
-              autoStart={autoStart}
-              onToggleFocusMode={onToggleFocusMode}
-              onToggleReminderPause={onToggleReminderPause}
-              onTestReminder={onTestReminder}
-              onExportBackup={onExportBackup}
+              stats={stats}
+              risks={risks}
+              review={review}
+              activeFilter={activeFilter}
+              motionMode={motionMode}
+              aiBusy={aiBusy}
+              onDailySummary={onDailySummary}
+              onDailyRoast={onDailyRoast}
+              onAiNextStep={onAiNextStep}
+              onAiOrganize={onAiOrganize}
+              onDailyPlan={onDailyPlan}
+              onRiskRadar={onRiskRadar}
+              onCleanupWall={onCleanupWall}
               onDailyReview={onDailyReview}
-              onEdit={onEditReminder}
-              onComplete={onCompleteReminder}
-              onRefresh={onRefresh}
+              onOpenAiSettings={onOpenAiSettings}
+              onSnoozeReminder={onSnoozeReminder}
+              onEditReminder={onEditReminder}
+              onCompleteReminder={onCompleteReminder}
+              onArchiveReminder={onArchiveReminder}
+              onConvertReminderToNote={onConvertReminderToNote}
+              onToggleReminderPriority={onToggleReminderPriority}
             />
           )}
+          {mode === 'center' && (
+            <section className="h-full min-h-0 overflow-y-auto rounded-[26px] border border-white/72 bg-white/54 p-3 shadow-[0_1px_2px_rgba(15,23,42,.04),0_18px_52px_rgba(68,83,120,.095)] backdrop-blur-2xl">
+              <BattleQuestPanel progress={progress} context={battleContext} onCompleteQuest={onCompleteBattleQuest} />
+              <div className="mt-3">
+                <BattleRewardsPanel
+                  progress={progress}
+                  achievements={achievementCards}
+                  onThemeChange={onThemeChange}
+                  onSkinChange={onSkinChange}
+                  onToggleGamification={onToggleGamification}
+                />
+              </div>
+            </section>
+          )}
           {mode === 'timeline' && (
-            <ReminderTimeline reminders={reminders} onEdit={onEditReminder} onComplete={onCompleteReminder} />
+            <section className="h-full min-h-0 overflow-y-auto rounded-[26px] border border-white/72 bg-white/54 p-3 shadow-[0_1px_2px_rgba(15,23,42,.04),0_18px_52px_rgba(68,83,120,.095)] backdrop-blur-2xl">
+              <BattleGrowthPanel progress={progress} stats={stats} review={review} />
+              <div className="mt-3">
+                <ReminderTimeline reminders={reminders} onEdit={onEditReminder} onComplete={onCompleteReminder} />
+              </div>
+              <div className="mt-3">
+                <ReminderHistoryCard events={reminderEvents} />
+              </div>
+            </section>
           )}
         </motion.div>
       </AnimatePresence>
+
+      <section className="shrink-0 rounded-[24px] border border-white/72 bg-white/58 p-2 shadow-[0_1px_2px_rgba(15,23,42,.04),0_14px_34px_rgba(68,83,120,.08)] backdrop-blur-2xl">
+        <div className="grid grid-cols-4 gap-1.5">
+          <RailMiniAction title="新增" icon="+" onClick={onCreateReminder} />
+          <RailMiniAction title="诊断" icon="!" onClick={onReminderDiagnostics} />
+          <RailMiniAction title="备份" icon="⇩" onClick={onExportBackup} />
+          <RailMiniAction title="设置" icon="⚙" onClick={onOpenAiSettings} />
+        </div>
+      </section>
     </aside>
   );
 }
 
-function DailyQueueButton({
+function DailyQueueCompactItem({
   item,
   index,
   status,
   onClick,
   onDone,
-  onSkip,
   onRestore,
 }: {
   item: DailyQueueItem;
@@ -2103,62 +2545,159 @@ function DailyQueueButton({
   status: DailyQueueItemStatus;
   onClick: () => void;
   onDone: () => void;
-  onSkip: () => void;
   onRestore: () => void;
 }) {
-  const badge = item.kind === 'reminder' ? '提醒' : item.kind === 'note' ? '便签' : '默认';
-  const icon = item.kind === 'reminder' ? '◷' : item.kind === 'note' ? '✦' : '+';
-  const toneClass =
-    item.kind === 'reminder'
-      ? 'border-rose-100 bg-rose-50/64 text-rose-700'
-      : item.kind === 'note'
-        ? 'border-sky-100 bg-sky-50/64 text-sky-700'
-        : 'border-zinc-100 bg-white/70 text-zinc-600';
-  const statusLabel = status === 'done' ? '已完成' : status === 'skipped' ? '已跳过' : item.actionLabel;
-  const mutedClass = status === 'open' ? '' : 'opacity-62';
-
+  const statusText = status === 'done' ? '已完成' : status === 'skipped' ? '已跳过' : '推进';
   return (
-    <div
-      className={`group rounded-[20px] border border-white/74 bg-white/68 px-3 py-2.5 shadow-[0_1px_2px_rgba(15,23,42,.035)] transition hover:-translate-y-0.5 hover:bg-white hover:shadow-[0_12px_28px_rgba(15,23,42,.09)] ${mutedClass}`}
-    >
-      <button type="button" className="flex w-full items-start gap-2 text-left" onClick={onClick}>
-        <span className={`mt-0.5 grid h-8 w-8 shrink-0 place-items-center rounded-2xl border text-xs font-black ${toneClass}`}>{icon}</span>
-        <span className="min-w-0 flex-1">
-          <span className="flex items-center gap-1.5 text-[10px] font-black uppercase tracking-[.16em] text-zinc-400">
-            #{index + 1} {badge}
-          </span>
-          <span className="mt-1 block truncate text-[13px] font-black text-zinc-800">{item.title}</span>
-          <span className="mt-0.5 block line-clamp-2 text-[11px] font-semibold leading-4 text-zinc-500">{item.reason}</span>
-        </span>
-        <span className="mt-1 shrink-0 rounded-full bg-zinc-950 px-2.5 py-1 text-[10px] font-black text-white">
-          {statusLabel}
-        </span>
+    <div className={`flex items-center gap-2 rounded-[18px] border border-white/70 bg-white/66 px-2.5 py-2 ${status === 'open' ? '' : 'opacity-62'}`}>
+      <button className="min-w-0 flex-1 text-left" onClick={onClick}>
+        <span className="block truncate text-[11px] font-black text-zinc-800">#{index + 1} {item.title}</span>
+        <span className="mt-0.5 block truncate text-[10px] font-bold text-zinc-400">{item.reason}</span>
       </button>
-      <div className="mt-2 flex items-center justify-end gap-1.5 border-t border-white/68 pt-2">
-        {status === 'open' ? (
-          <>
-            <DailyQueueMicroAction label="完成" onClick={onDone} />
-            <DailyQueueMicroAction label="跳过" onClick={onSkip} muted />
-          </>
-        ) : (
-          <DailyQueueMicroAction label="恢复" onClick={onRestore} />
-        )}
-      </div>
+      {status === 'open' ? (
+        <button className="shrink-0 rounded-full bg-zinc-950 px-2.5 py-1 text-[10px] font-black text-white" onClick={onDone}>{statusText}</button>
+      ) : (
+        <button className="shrink-0 rounded-full bg-white/72 px-2.5 py-1 text-[10px] font-black text-zinc-500" onClick={onRestore}>恢复</button>
+      )}
     </div>
   );
 }
 
-function DailyQueueMicroAction({ label, muted = false, onClick }: { label: string; muted?: boolean; onClick: () => void }) {
+function BattleTodayReportPanel({
+  loading,
+  reminders,
+  diagnostics,
+  stats,
+  risks,
+  review,
+  activeFilter,
+  motionMode,
+  aiBusy,
+  onDailySummary,
+  onDailyRoast,
+  onAiNextStep,
+  onAiOrganize,
+  onDailyPlan,
+  onRiskRadar,
+  onCleanupWall,
+  onDailyReview,
+  onOpenAiSettings,
+  onSnoozeReminder,
+  onEditReminder,
+  onCompleteReminder,
+  onArchiveReminder,
+  onConvertReminderToNote,
+  onToggleReminderPriority,
+}: {
+  loading: boolean;
+  reminders: BackendReminder[];
+  diagnostics: ReminderDiagnostics | null;
+  stats: DashboardStats;
+  risks: RiskRadarItem[];
+  review: DailyReview;
+  activeFilter: DashboardFilter;
+  motionMode: MotionMode;
+  aiBusy: string | null;
+  onDailySummary: () => void;
+  onDailyRoast: () => void;
+  onAiNextStep: () => void;
+  onAiOrganize: () => void;
+  onDailyPlan: () => void;
+  onRiskRadar: () => void;
+  onCleanupWall: () => void;
+  onDailyReview: () => void;
+  onOpenAiSettings: () => void;
+  onSnoozeReminder: (reminder: BackendReminder, minutes: number) => void;
+  onEditReminder: (reminder: BackendReminder) => void;
+  onCompleteReminder: (id: number) => void;
+  onArchiveReminder: (id: number) => void;
+  onConvertReminderToNote: (reminder: BackendReminder) => void;
+  onToggleReminderPriority: (reminder: BackendReminder) => void;
+}) {
+  const firstRisk = risks[0];
+  const nextTask = firstRisk?.title ?? stats.headline;
+  const clarityAdvice = stats.delayDebt > 0
+    ? `先清掉 ${stats.delayDebt} 个拖延债，再推进主线。`
+    : stats.missingNextStepNotes > 0
+      ? `还有 ${stats.missingNextStepNotes} 张便签缺下一步，先让它们变成行动。`
+      : '战场清晰，适合直接推进一个高价值事项。';
+
   return (
-    <button
-      type="button"
-      className={`rounded-full px-2.5 py-1 text-[10px] font-black transition ${
-        muted ? 'bg-white/62 text-zinc-400 hover:bg-white hover:text-zinc-700' : 'bg-zinc-950 text-white hover:bg-zinc-800'
-      }`}
-      onClick={onClick}
-    >
-      {label}
-    </button>
+    <section className="flex h-full min-h-0 flex-col overflow-hidden rounded-[26px] border border-white/72 bg-white/54 p-3.5 shadow-[0_1px_2px_rgba(15,23,42,.04),0_18px_52px_rgba(68,83,120,.095)] backdrop-blur-2xl">
+      <div className="mb-3 flex items-start justify-between gap-3 px-1">
+        <div className="min-w-0">
+          <p className="text-xs font-black uppercase tracking-[.26em] text-sky-600">Today Report</p>
+          <h2 className="mt-0.5 truncate text-lg font-black tracking-[-.02em]">今日战报</h2>
+          <p className="mt-0.5 line-clamp-1 text-[11px] font-semibold text-zinc-400">{activeFilter === 'highPriority' ? '重点突破视角' : '默认作战视角'}</p>
+        </div>
+        <button className="rounded-full bg-white/74 px-3 py-1.5 text-xs font-black text-zinc-500 shadow-sm transition hover:bg-white hover:text-zinc-900" onClick={onDailyReview}>
+          生成复盘
+        </button>
+      </div>
+
+      <div className="grid grid-cols-2 gap-2">
+        <ReviewMetric label="Focus" value={stats.focusScore} suffix="" tone="sky" />
+        <ReviewMetric label="转行动" value={stats.conversionRate} suffix="%" tone="violet" />
+        <ReviewMetric label="清爽度" value={stats.cleanliness} suffix="%" tone="emerald" />
+        <MiniStat label="拖延债" value={stats.delayDebt} tone="rose" />
+      </div>
+
+      <div className="mt-3 grid grid-cols-2 gap-2">
+        <section className="rounded-[20px] border border-white/70 bg-white/60 p-3">
+          <p className="text-[10px] font-black uppercase tracking-[.18em] text-zinc-400">Next Battle</p>
+          <h3 className="mt-1 line-clamp-2 text-sm font-black text-zinc-900">{nextTask}</h3>
+          <button className="mt-2 rounded-full bg-zinc-950 px-3 py-1.5 text-[11px] font-black text-white" onClick={firstRisk ? onRiskRadar : onDailyPlan}>
+            {firstRisk ? '扫风险' : '作战顺序'}
+          </button>
+        </section>
+        <section className="rounded-[20px] border border-white/70 bg-white/60 p-3">
+          <p className="text-[10px] font-black uppercase tracking-[.18em] text-zinc-400">Clarity</p>
+          <p className="mt-1 line-clamp-3 text-[11px] font-bold leading-4 text-zinc-500">{clarityAdvice}</p>
+          <button className="mt-2 rounded-full bg-white/82 px-3 py-1.5 text-[11px] font-black text-zinc-600" onClick={onCleanupWall}>清墙面</button>
+        </section>
+      </div>
+
+      <div className="mt-3 min-h-0 flex-1 overflow-y-auto pr-1">
+        <AiCommanderPanel
+          aiBusy={aiBusy}
+          stats={stats}
+          motionMode={motionMode}
+          onDailySummary={onDailySummary}
+          onDailyRoast={onDailyRoast}
+          onAiNextStep={onAiNextStep}
+          onAiOrganize={onAiOrganize}
+          onDailyPlan={onDailyPlan}
+          onRiskRadar={onRiskRadar}
+          onCleanupWall={onCleanupWall}
+          onDailyReview={onDailyReview}
+          onOpenAiSettings={onOpenAiSettings}
+        />
+        <section className="mt-3 rounded-[22px] border border-white/70 bg-white/42 p-3">
+          <div className="mb-2 flex items-center justify-between">
+            <h3 className="text-sm font-black text-zinc-700">战报摘要</h3>
+            <span className="rounded-full bg-white/72 px-2.5 py-1 text-[10px] font-black text-zinc-400">{review.completedReminders} 完成</span>
+          </div>
+          <div className="space-y-2">
+            {review.summaryLines.slice(0, 2).map((line) => (
+              <p key={line} className="rounded-2xl bg-white/60 px-3 py-2 text-[11px] font-bold leading-4 text-zinc-500">{line}</p>
+            ))}
+          </div>
+        </section>
+        <div className="mt-3 min-h-[220px]">
+          <ReminderList
+            loading={loading}
+            reminders={reminders}
+            diagnostics={diagnostics}
+            onSnooze={onSnoozeReminder}
+            onEdit={onEditReminder}
+            onComplete={onCompleteReminder}
+            onArchive={onArchiveReminder}
+            onConvertToNote={onConvertReminderToNote}
+            onTogglePriority={onToggleReminderPriority}
+          />
+        </div>
+      </div>
+    </section>
   );
 }
 
@@ -2175,226 +2714,144 @@ function RailMiniAction({ title, icon, onClick }: { title: string; icon: string;
   );
 }
 
-function RailToolAction({ title, onClick }: { title: string; onClick: () => void }) {
-  return (
-    <button
-      type="button"
-      className="rounded-xl px-2 py-1.5 text-[10px] font-black text-zinc-400 transition hover:bg-white/70 hover:text-zinc-700"
-      onClick={onClick}
-    >
-      {title}
-    </button>
-  );
-}
-
-function RecentReminderList({
-  reminders,
-  onEdit,
-}: {
-  reminders: BackendReminder[];
-  onEdit: (reminder: BackendReminder) => void;
-}) {
-  if (reminders.length === 0) {
-    return <p className="rounded-2xl border border-dashed border-zinc-900/10 bg-white/35 px-4 py-5 text-center text-xs font-semibold text-zinc-400">暂无最近提醒。</p>;
-  }
-
-  return (
-    <div className="space-y-2">
-      {reminders.slice(0, 4).map((reminder) => {
-        const fired = Boolean(reminder.fired_at);
-        return (
-          <motion.button
-            key={reminder.id}
-            type="button"
-            className={`group flex w-full items-center gap-3 rounded-2xl border px-3 py-2.5 text-left transition ${
-              fired
-                ? 'border-emerald-100 bg-emerald-50/62 hover:bg-emerald-50'
-                : 'border-sky-100 bg-sky-50/54 hover:bg-sky-50'
-            }`}
-            whileHover={{ x: 2 }}
-            whileTap={{ scale: 0.99 }}
-            onClick={() => {
-              if (!reminder.completed) onEdit(reminder);
-            }}
-          >
-            <span className={`grid h-9 w-9 shrink-0 place-items-center rounded-2xl text-sm shadow-sm ${fired ? 'bg-emerald-500 text-white' : 'bg-sky-500 text-white'}`}>
-              {fired ? '✓' : '◷'}
-            </span>
-            <span className="min-w-0 flex-1">
-              <span className="block truncate text-xs font-black text-zinc-700">{reminder.title}</span>
-              <span className="mt-0.5 block truncate text-[11px] font-semibold text-zinc-400">
-                {fired
-                  ? `已提醒 · ${formatReminderTime(reminder.fired_at ?? reminder.due_at)}`
-                  : `待提醒 · ${formatReminderTime(reminder.next_due_at ?? reminder.due_at)} · ${repeatRuleLabel(reminder.repeat_rule)}`}
-              </span>
-            </span>
-            {reminder.priority === 'high' && <span className="rounded-full bg-rose-100 px-2 py-1 text-[10px] font-black text-rose-500">高</span>}
-          </motion.button>
-        );
-      })}
-    </div>
-  );
-}
-
-function ReminderCenter({
-  reminders,
-  recentReminders,
-  reminderEvents,
-  diagnostics,
-  focusMode,
-  remindersPaused,
-  autoStart,
-  onToggleFocusMode,
-  onToggleReminderPause,
-  onTestReminder,
-  onExportBackup,
+function AiCommanderPanel({
+  aiBusy,
+  stats,
+  motionMode,
+  onDailySummary,
+  onDailyRoast,
+  onAiNextStep,
+  onAiOrganize,
+  onDailyPlan,
+  onRiskRadar,
+  onCleanupWall,
   onDailyReview,
-  onEdit,
-  onComplete,
-  onRefresh,
+  onOpenAiSettings,
 }: {
-  reminders: BackendReminder[];
-  recentReminders: BackendReminder[];
-  reminderEvents: ReminderEvent[];
-  diagnostics: ReminderDiagnostics | null;
-  focusMode: boolean;
-  remindersPaused: boolean;
-  autoStart: boolean;
-  onToggleFocusMode: () => void;
-  onToggleReminderPause: () => void;
-  onTestReminder: () => void;
-  onExportBackup: () => void;
+  aiBusy: string | null;
+  stats: DashboardStats;
+  motionMode: MotionMode;
+  onDailySummary: () => void;
+  onDailyRoast: () => void;
+  onAiNextStep: () => void;
+  onAiOrganize: () => void;
+  onDailyPlan: () => void;
+  onRiskRadar: () => void;
+  onCleanupWall: () => void;
   onDailyReview: () => void;
-  onEdit: (reminder: BackendReminder) => void;
-  onComplete: (id: number) => void;
-  onRefresh: () => void;
+  onOpenAiSettings: () => void;
 }) {
-  const now = Date.now();
-  const overdue = reminders.filter((reminder) => reminder.next_due_at && new Date(reminder.next_due_at).getTime() < now);
-  const today = reminders.filter((reminder) => isSameLocalDay(reminder.next_due_at ?? reminder.due_at, new Date()));
-  const repeating = reminders.filter((reminder) => reminder.repeat_rule.kind !== 'none');
+  const loopMotion = shouldLoopMotion(motionMode);
+  const wildMotion = motionMode === 'wild';
+  const actions = [
+    { title: aiBusy === 'summary' ? '生成中' : '战况总览', hint: '把今天压缩成一句话', icon: '☀', tone: 'sky' as const, onClick: onDailySummary },
+    { title: '作战顺序', hint: '先做什么一眼看到', icon: '☑', tone: 'zinc' as const, onClick: onDailyPlan },
+    { title: aiBusy === 'nextStep' ? '生成中' : 'AI 下一步', hint: '把灵感变成行动', icon: '✓', tone: 'violet' as const, onClick: onAiNextStep },
+    { title: aiBusy === 'organize' ? '整理中' : '分类建议', hint: '今天做/等待/灵感', icon: '▦', tone: 'sky' as const, onClick: onAiOrganize },
+    { title: '风险雷达', hint: '找出快爆的事项', icon: '!', tone: 'rose' as const, onClick: onRiskRadar },
+    { title: '清墙面', hint: '归档重复和失焦内容', icon: '⌫', tone: 'emerald' as const, onClick: onCleanupWall },
+    { title: aiBusy === 'dailyRoast' ? '吐槽中' : '毒舌督办', hint: '用压力帮你动起来', icon: '⚡', tone: 'amber' as const, onClick: onDailyRoast },
+    { title: '今日复盘', hint: '晚上收束成战报', icon: '↺', tone: 'zinc' as const, onClick: onDailyReview },
+  ];
 
   return (
-    <section className="flex h-full min-h-0 flex-col overflow-hidden rounded-[26px] border border-white/72 bg-white/54 p-3.5 shadow-[0_1px_2px_rgba(15,23,42,.04),0_18px_52px_rgba(68,83,120,.095)] backdrop-blur-2xl">
-      <div className="mb-3 flex items-center justify-between px-1">
-        <div>
-          <p className="text-xs font-semibold uppercase tracking-[.26em] text-violet-600">Reminder Hub</p>
-          <h2 className="mt-0.5 text-lg font-semibold tracking-[-.02em]">提醒中心</h2>
+    <section className="rounded-[24px] border border-white/72 bg-[linear-gradient(135deg,rgba(255,255,255,.78),rgba(239,246,255,.58),rgba(250,245,255,.58))] p-3 shadow-[inset_0_1px_0_rgba(255,255,255,.82),0_14px_34px_rgba(68,83,120,.07)]">
+      <div className="flex items-start justify-between gap-3">
+        <div className="min-w-0">
+          <p className="text-[10px] font-black uppercase tracking-[.24em] text-violet-600">AI Commander</p>
+          <h3 className="mt-1 text-sm font-black tracking-[-.02em] text-zinc-900">本小姐先替你接管混乱</h3>
+          <p className="mt-1 line-clamp-2 text-[11px] font-semibold leading-4 text-zinc-500">当前主线：{stats.headline} · 拖延债 {stats.delayDebt} · 清爽度 {stats.cleanliness}%</p>
         </div>
-        <button className="rounded-full bg-white/74 px-3 py-1.5 text-xs font-black text-zinc-500 shadow-sm" onClick={onRefresh}>
-          ↻ 刷新
+        <button
+          type="button"
+          className="shrink-0 rounded-2xl border border-white/70 bg-white/72 px-2.5 py-2 text-[10px] font-black text-zinc-500 transition hover:bg-white hover:text-zinc-900"
+          onClick={onOpenAiSettings}
+        >
+          设置
         </button>
       </div>
-
-      <div className="grid grid-cols-3 gap-2">
-        <StatusPill active={!remindersPaused} label={remindersPaused ? '已暂停' : '运行中'} icon="◷" tone={remindersPaused ? 'rose' : 'emerald'} />
-        <StatusPill active={focusMode} label={focusMode ? '专注中' : '普通'} icon="✦" tone={focusMode ? 'sky' : 'zinc'} />
-        <StatusPill active={autoStart} label={autoStart ? '自启' : '手动'} icon="↗" tone={autoStart ? 'violet' : 'zinc'} />
-      </div>
-
       <div className="mt-3 grid grid-cols-2 gap-2">
-        <button
-          className={`rounded-2xl px-3 py-2.5 text-xs font-black transition ${
-            focusMode ? 'bg-sky-600 text-white shadow-[0_12px_26px_rgba(14,165,233,.22)]' : 'bg-white/72 text-zinc-600 hover:bg-white'
-          }`}
-          onClick={onToggleFocusMode}
-        >
-          {focusMode ? '关闭专注' : '开启专注'}
-        </button>
-        <button
-          className={`rounded-2xl px-3 py-2.5 text-xs font-black transition ${
-            remindersPaused ? 'bg-rose-500 text-white shadow-[0_12px_26px_rgba(244,63,94,.20)]' : 'bg-white/72 text-zinc-600 hover:bg-white'
-          }`}
-          onClick={onToggleReminderPause}
-        >
-          {remindersPaused ? '恢复提醒' : '暂停提醒'}
-        </button>
-      </div>
-
-      <div className="mt-2 grid grid-cols-3 gap-2">
-        <button className="rounded-2xl bg-white/72 px-3 py-2.5 text-xs font-black text-zinc-600 transition hover:bg-white" onClick={onTestReminder}>
-          测试提醒
-        </button>
-        <button className="rounded-2xl bg-white/72 px-3 py-2.5 text-xs font-black text-zinc-600 transition hover:bg-white" onClick={onDailyReview}>
-          今日复盘
-        </button>
-        <button className="rounded-2xl bg-white/72 px-3 py-2.5 text-xs font-black text-zinc-600 transition hover:bg-white" onClick={onExportBackup}>
-          备份
-        </button>
-      </div>
-
-      <div className="mt-3 grid grid-cols-3 gap-2">
-        <MiniStat label="过期" value={overdue.length} tone="rose" />
-        <MiniStat label="今日" value={today.length} tone="sky" />
-        <MiniStat label="重复" value={repeating.length} tone="violet" />
-      </div>
-
-      <div className="mt-3 min-h-0 flex-1 overflow-y-auto pr-1">
-        <DiagnosticsCard diagnostics={diagnostics} />
-        <ReminderCenterGroup title="过期提醒" reminders={overdue} empty="没有过期提醒，表现不错嘛。" onEdit={onEdit} onComplete={onComplete} />
-        <ReminderCenterGroup title="今日提醒" reminders={today} empty="今天暂时没有提醒。" onEdit={onEdit} onComplete={onComplete} />
-        <ReminderHistoryCard events={reminderEvents} />
-        <div className="mt-3 rounded-[22px] border border-white/70 bg-white/42 p-3">
-          <div className="mb-2 flex items-center justify-between">
-            <h3 className="text-sm font-black text-zinc-700">最近提醒</h3>
-            <span className="rounded-full bg-white/72 px-2.5 py-1 text-[11px] font-black text-zinc-400">{recentReminders.length}</span>
-          </div>
-          <RecentReminderList reminders={recentReminders} onEdit={onEdit} />
-        </div>
+        {actions.map((action, index) => (
+          <CommanderTile
+            key={action.title}
+            {...action}
+            index={index}
+            loopMotion={loopMotion}
+            wildMotion={wildMotion}
+          />
+        ))}
       </div>
     </section>
   );
 }
 
-function StatusPill({ active, label, icon, tone }: { active: boolean; label: string; icon: string; tone: 'emerald' | 'rose' | 'sky' | 'violet' | 'zinc' }) {
+function CommanderTile({
+  title,
+  hint,
+  icon,
+  tone,
+  index,
+  loopMotion,
+  wildMotion,
+  onClick,
+}: {
+  title: string;
+  hint: string;
+  icon: string;
+  tone: 'sky' | 'amber' | 'violet' | 'rose' | 'emerald' | 'zinc';
+  index: number;
+  loopMotion: boolean;
+  wildMotion: boolean;
+  onClick: () => void;
+}) {
   const toneClass = {
-    emerald: 'bg-emerald-50 text-emerald-700 border-emerald-100',
-    rose: 'bg-rose-50 text-rose-600 border-rose-100',
-    sky: 'bg-sky-50 text-sky-700 border-sky-100',
-    violet: 'bg-violet-50 text-violet-700 border-violet-100',
-    zinc: 'bg-white/60 text-zinc-500 border-white/70',
+    sky: 'border-sky-100 bg-sky-50/70 text-sky-700',
+    amber: 'border-amber-100 bg-amber-50/70 text-amber-700',
+    violet: 'border-violet-100 bg-violet-50/70 text-violet-700',
+    rose: 'border-rose-100 bg-rose-50/70 text-rose-700',
+    emerald: 'border-emerald-100 bg-emerald-50/70 text-emerald-700',
+    zinc: 'border-zinc-100 bg-white/70 text-zinc-700',
   }[tone];
-  return (
-    <div className={`rounded-2xl border px-2.5 py-2 text-center text-[11px] font-black ${toneClass}`}>
-      <span className="mr-1">{icon}</span>
-      {label}
-      {active && <span className="ml-1 inline-block h-1.5 w-1.5 rounded-full bg-current align-middle opacity-65" />}
-    </div>
-  );
-}
 
-function DiagnosticsCard({ diagnostics }: { diagnostics: ReminderDiagnostics | null }) {
   return (
-    <div className="mb-3 rounded-[22px] border border-white/70 bg-white/42 p-3">
-      <div className="mb-2 flex items-center justify-between">
-        <h3 className="text-sm font-black text-zinc-700">提醒诊断</h3>
-        <span className="rounded-full bg-white/72 px-2.5 py-1 text-[11px] font-black text-zinc-400">Trust</span>
-      </div>
-      {!diagnostics ? (
-        <p className="text-xs font-semibold text-zinc-400">诊断信息暂时不可用。</p>
-      ) : (
-        <div className="space-y-2 text-[11px] font-bold text-zinc-500">
-          <DiagnosticRow label="通知权限" value={diagnostics.notificationPermission} />
-          <DiagnosticRow label="下次提醒" value={diagnostics.nextDueAt ? formatReminderTime(diagnostics.nextDueAt) : '暂无'} />
-          <DiagnosticRow label="数据库" value={diagnostics.databasePath} />
-          <DiagnosticRow label="检查时间" value={formatReminderTime(diagnostics.checkedAt)} />
-        </div>
-      )}
-    </div>
-  );
-}
-
-function DiagnosticRow({ label, value }: { label: string; value: string }) {
-  return (
-    <div className="flex gap-2 rounded-2xl bg-white/48 px-3 py-2">
-      <span className="shrink-0 text-zinc-400">{label}</span>
-      <span className="min-w-0 flex-1 truncate text-right text-zinc-600" title={value}>
-        {value}
+    <motion.button
+      type="button"
+      className={`group overflow-hidden rounded-[18px] border px-3 py-2.5 text-left shadow-sm transition hover:-translate-y-0.5 hover:bg-white ${toneClass}`}
+      animate={loopMotion ? { y: [0, wildMotion ? -5 : -2, 0] } : { y: 0 }}
+      transition={{ duration: wildMotion ? 1.5 + index * 0.08 : 3 + index * 0.12, repeat: loopMotion ? Infinity : 0, ease: 'easeInOut' }}
+      onClick={onClick}
+    >
+      <span className="flex items-center gap-2">
+        <span className="grid h-7 w-7 shrink-0 place-items-center rounded-2xl bg-white/82 text-xs font-black shadow-sm">{icon}</span>
+        <span className="min-w-0">
+          <span className="block truncate text-[12px] font-black">{title}</span>
+          <span className="mt-0.5 block truncate text-[10px] font-semibold opacity-62">{hint}</span>
+        </span>
       </span>
-    </div>
+    </motion.button>
   );
 }
 
+function ReviewMetric({ label, value, suffix, tone }: { label: string; value: number; suffix: string; tone: 'sky' | 'violet' | 'emerald' }) {
+  const accentClass = {
+    sky: 'from-sky-500 to-cyan-400',
+    violet: 'from-violet-500 to-fuchsia-400',
+    emerald: 'from-emerald-400 to-teal-500',
+  }[tone];
+  const textClass = {
+    sky: 'text-sky-700',
+    violet: 'text-violet-700',
+    emerald: 'text-emerald-700',
+  }[tone];
+
+  return (
+    <div className="relative overflow-hidden rounded-[20px] border border-white/70 bg-white/64 p-3 shadow-sm">
+      <div className={`absolute inset-x-0 top-0 h-1 bg-gradient-to-r ${accentClass}`} />
+      <p className="text-[10px] font-black uppercase tracking-[.14em] text-zinc-400">{label}</p>
+      <p className={`mt-2 text-2xl font-black leading-none tabular-nums ${textClass}`}>{value}<span className="text-xs">{suffix}</span></p>
+    </div>
+  );
+}
 function ReminderHistoryCard({ events }: { events: ReminderEvent[] }) {
   const labelMap: Record<string, string> = {
     created: '创建',
@@ -2433,48 +2890,17 @@ function ReminderHistoryCard({ events }: { events: ReminderEvent[] }) {
   );
 }
 
-function MiniStat({ label, value, tone }: { label: string; value: number; tone: 'rose' | 'sky' | 'violet' }) {
+function MiniStat({ label, value, tone }: { label: string; value: number; tone: 'rose' | 'sky' | 'violet' | 'emerald' }) {
   const toneClass = {
     rose: 'from-rose-50 to-orange-50 text-rose-600',
     sky: 'from-sky-50 to-cyan-50 text-sky-600',
     violet: 'from-violet-50 to-fuchsia-50 text-violet-600',
+    emerald: 'from-emerald-50 to-teal-50 text-emerald-600',
   }[tone];
   return (
     <div className={`rounded-2xl bg-gradient-to-br ${toneClass} px-3 py-2.5 shadow-[inset_0_1px_0_rgba(255,255,255,.8)]`}>
       <p className="text-[11px] font-black opacity-65">{label}</p>
       <p className="mt-1 text-2xl font-black leading-none tracking-[-.04em]">{value}</p>
-    </div>
-  );
-}
-
-function ReminderCenterGroup({
-  title,
-  reminders,
-  empty,
-  onEdit,
-  onComplete,
-}: {
-  title: string;
-  reminders: BackendReminder[];
-  empty: string;
-  onEdit: (reminder: BackendReminder) => void;
-  onComplete: (id: number) => void;
-}) {
-  return (
-    <div className="mt-3 first:mt-0 rounded-[22px] border border-white/70 bg-white/42 p-3">
-      <div className="mb-2 flex items-center justify-between">
-        <h3 className="text-sm font-black text-zinc-700">{title}</h3>
-        <span className="rounded-full bg-white/72 px-2.5 py-1 text-[11px] font-black text-zinc-400">{reminders.length}</span>
-      </div>
-      {reminders.length === 0 ? (
-        <p className="rounded-2xl border border-dashed border-zinc-900/10 bg-white/32 px-3 py-4 text-center text-xs font-semibold text-zinc-400">{empty}</p>
-      ) : (
-        <div className="space-y-2">
-          {reminders.slice(0, 5).map((reminder) => (
-            <ReminderMiniItem key={reminder.id} reminder={reminder} onEdit={onEdit} onComplete={onComplete} />
-          ))}
-        </div>
-      )}
     </div>
   );
 }
@@ -2559,59 +2985,6 @@ function ReminderTimeline({
     </section>
   );
 }
-
-function QuickAction({
-  title,
-  icon,
-  tone,
-  motionMode,
-  onClick,
-}: {
-  title: string;
-  icon: string;
-  tone: 'violet' | 'sky' | 'amber' | 'emerald' | 'rose';
-  motionMode: MotionMode;
-  onClick: () => void;
-}) {
-  const calmMotion = motionMode === 'calm';
-  const wildMotion = motionMode === 'wild';
-  const toneClass = {
-    violet: 'from-violet-500 to-fuchsia-400 shadow-violet-500/20',
-    sky: 'from-sky-500 to-cyan-400 shadow-sky-500/20',
-    amber: 'from-amber-400 to-orange-500 shadow-orange-500/20',
-    emerald: 'from-emerald-400 to-teal-500 shadow-emerald-500/20',
-    rose: 'from-rose-500 to-pink-400 shadow-rose-500/20',
-  }[tone];
-  return (
-    <motion.button
-      title={title}
-      aria-label={title}
-      animate={calmMotion ? { y: 0, rotate: 0 } : { y: [0, wildMotion ? -12 : -6, 0], rotate: [0, wildMotion ? -3 : -1.5, wildMotion ? 3 : 1.5, 0] }}
-      transition={{ duration: wildMotion ? 1.45 : 2.4, repeat: calmMotion ? 0 : Infinity, ease: 'easeInOut' }}
-      whileHover={{ y: calmMotion ? -3 : wildMotion ? -18 : -8, scale: calmMotion ? 1.025 : wildMotion ? 1.14 : 1.06, rotate: calmMotion ? 0 : wildMotion ? -4 : -1.5 }}
-      whileTap={{ scale: 0.96 }}
-      className="group relative grid min-h-[76px] place-items-center overflow-hidden rounded-2xl border border-white/70 bg-white/74 p-2 text-center shadow-[0_1px_2px_rgba(15,23,42,.03),0_10px_26px_rgba(68,83,120,.075)] transition hover:border-white hover:bg-white hover:shadow-[0_1px_2px_rgba(15,23,42,.04),0_16px_34px_rgba(68,83,120,.12)]"
-      onClick={onClick}
-    >
-      <div className={`absolute -right-7 -top-7 h-20 w-20 rounded-full bg-gradient-to-br ${toneClass} opacity-20 blur-2xl transition group-hover:opacity-36`} />
-      <motion.div
-        className="pointer-events-none absolute inset-y-0 -left-12 w-10 rotate-12 bg-white/40 blur-sm"
-        animate={calmMotion ? { x: -60, opacity: 0 } : { x: [-60, 180], opacity: 1 }}
-        transition={{ duration: wildMotion ? 1.05 : 2.2, repeat: calmMotion ? 0 : Infinity, repeatDelay: wildMotion ? 0.18 : 1.4, ease: 'easeInOut' }}
-      />
-      <motion.span
-        className={`relative grid h-8 w-8 place-items-center rounded-2xl bg-gradient-to-br ${toneClass} text-sm text-white shadow-lg transition group-hover:scale-105`}
-        animate={calmMotion ? { rotate: 0, scale: 1 } : { rotate: [0, 360], scale: [1, wildMotion ? 1.22 : 1.08, 1] }}
-        transition={{ rotate: { duration: wildMotion ? 2.8 : 5.5, repeat: calmMotion ? 0 : Infinity, ease: 'linear' }, scale: { duration: wildMotion ? 0.95 : 2.4, repeat: calmMotion ? 0 : Infinity, ease: 'easeInOut' } }}
-        whileHover={{ rotate: calmMotion ? 0 : [0, -14, 14, 0] }}
-      >
-        {icon}
-      </motion.span>
-      <span className="relative mt-1.5 block text-[11px] font-semibold text-zinc-700">{title}</span>
-    </motion.button>
-  );
-}
-
 
 function IconActionButton({
   label,
@@ -4393,6 +4766,7 @@ function mergeAttachments(current: NoteAttachment[], incoming: NoteAttachment[])
 function formatError(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
+
 
 
 

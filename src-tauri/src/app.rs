@@ -414,7 +414,11 @@ pub fn export_backup(app: AppHandle, state: State<'_, AppState>) -> Result<Backu
             store.list_reminder_events(100).map_err(to_command_error)?,
         )
     };
-    let backup_dir = app.path().app_data_dir().map_err(to_display_error)?.join("backups");
+    let app_data_dir = app.path().app_data_dir().map_err(to_display_error)?;
+    let progress = fs::read_to_string(app_data_dir.join("progress.json"))
+        .ok()
+        .and_then(|content| serde_json::from_str::<serde_json::Value>(&content).ok());
+    let backup_dir = app_data_dir.join("backups");
     fs::create_dir_all(&backup_dir).map_err(to_display_error)?;
     let path = backup_dir.join(format!("qingmemo-backup-{}.json", Utc::now().format("%Y%m%d-%H%M%S")));
     let content = serde_json::to_string_pretty(&serde_json::json!({
@@ -423,6 +427,7 @@ pub fn export_backup(app: AppHandle, state: State<'_, AppState>) -> Result<Backu
         "notes": notes,
         "reminders": reminders,
         "reminder_events": events,
+        "progress": progress,
     }))
     .map_err(to_display_error)?;
     fs::write(&path, content).map_err(to_display_error)?;
@@ -456,9 +461,13 @@ pub fn save_ai_key(key: String) -> Result<AiKeyStatus, String> {
 fn build_tray(app: &mut App) -> tauri::Result<()> {
     let open = MenuItemBuilder::with_id("open", "打开轻备忘").build(app)?;
     let quick_add = MenuItemBuilder::with_id("quick_add", "快速新增").build(app)?;
+    let battle_quests = MenuItemBuilder::with_id("battle_quests", "查看今日作战任务").build(app)?;
+    let continue_battle = MenuItemBuilder::with_id("continue_battle", "继续作战").build(app)?;
     let toggle_pause = MenuItemBuilder::with_id("toggle_pause", "暂停/恢复提醒").build(app)?;
     let quit = MenuItemBuilder::with_id("quit", "退出").build(app)?;
-    let menu = MenuBuilder::new(app).items(&[&open, &quick_add, &toggle_pause, &quit]).build()?;
+    let menu = MenuBuilder::new(app)
+        .items(&[&open, &quick_add, &battle_quests, &continue_battle, &toggle_pause, &quit])
+        .build()?;
     let mut tray = TrayIconBuilder::with_id("main")
         .tooltip("轻备忘")
         .menu(&menu)
@@ -468,6 +477,14 @@ fn build_tray(app: &mut App) -> tauri::Result<()> {
             "quick_add" => {
                 show_main_window(app);
                 let _ = app.emit("quick-add", ());
+            }
+            "battle_quests" => {
+                show_main_window(app);
+                let _ = app.emit("show-battle-quests", ());
+            }
+            "continue_battle" => {
+                show_main_window(app);
+                let _ = app.emit("continue-battle", ());
             }
             "toggle_pause" => {
                 let state = app.state::<AppState>();

@@ -1,10 +1,11 @@
-﻿import { describe, expect, it } from 'vitest';
+import { describe, expect, it } from 'vitest';
 import {
   buildAiNextStepPrompt,
   buildDashboardStats,
   buildAttachmentFromPath,
   buildDailyChallenge,
   buildDailyQueue,
+  buildDailyQueueNoteStatusMap,
   dailyQueueItemKey,
   summarizeDailyQueueProgress,
   buildNoteInput,
@@ -223,6 +224,16 @@ describe('dashboard model helpers', () => {
     });
   });
 
+  it('maps completed daily queue notes for sticky wall status badges', () => {
+    const base = { ...toStickyNote(backendNote), pinned: false };
+    const queue = buildDailyQueue(
+      [{ ...base, id: 1, title: '今日方案', content: '今天确认报价 #客户', priority: 'high' as const }],
+      [{ ...backendReminder, id: 9, title: '过期发布', due_at: '2026-07-05T08:00:00Z', next_due_at: '2026-07-05T08:00:00Z' }],
+      new Date('2026-07-06T10:00:00Z'),
+    );
+
+    expect(buildDailyQueueNoteStatusMap(queue, { 'reminder:9': 'done', 'note:1': 'skipped' })).toEqual({ 1: 'skipped' });
+  });
   it('summarizes daily queue progress from local item states', () => {
     const base = { ...toStickyNote(backendNote), pinned: false };
     const queue = buildDailyQueue(
@@ -284,13 +295,31 @@ describe('dashboard model helpers', () => {
     });
   });
 
-  it('builds dashboard stats from notes and active reminders', () => {
-    const notes = [toStickyNote(backendNote), toStickyNote({ ...backendNote, id: 8, content: '重要 !!' })];
+  it('builds motivational dashboard stats from notes and active reminders', () => {
+    const base = { ...toStickyNote(backendNote), pinned: false };
+    const notes = [
+      { ...base, id: 1, title: '等待审批', content: '等待法务审批合同 #客户' },
+      { ...base, id: 2, title: '资料堆', content: '客户背景资料' },
+      { ...base, id: 3, title: '今日发布', content: '重要：今天发布版本 !!', priority: 'high' as const },
+    ];
+    const reminders = [
+      { ...backendReminder, id: 1, title: '过期提醒', due_at: '2026-07-05T08:00:00Z', next_due_at: '2026-07-05T08:00:00Z', priority: 'high' as const },
+      { ...backendReminder, id: 2, title: '已完成', completed: true, due_at: '2026-07-06T08:00:00Z', next_due_at: '2026-07-06T08:00:00Z', updated_at: '2026-07-06T09:00:00Z' },
+    ];
 
-    expect(buildDashboardStats(notes, [backendReminder])).toEqual({
+    expect(buildDashboardStats(notes, reminders, new Date('2026-07-06T10:00:00Z'))).toEqual({
       reminders: 1,
       highPriority: 2,
-      notes: 2,
+      notes: 3,
+      overdueReminders: 1,
+      waitingNotes: 1,
+      missingNextStepNotes: 1,
+      completedToday: 1,
+      delayDebt: 4,
+      focusScore: 62,
+      conversionRate: 67,
+      cleanliness: 100,
+      headline: '先清过期提醒',
     });
   });
 

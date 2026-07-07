@@ -9,6 +9,7 @@ import {
   compactSparseColumns,
   clampRotation,
   snapPoint,
+  toChangedLayoutPatches,
   toLayoutPatch,
 } from './layout';
 import type { StickyNote } from './types';
@@ -139,6 +140,22 @@ describe('sticky wall layout helpers', () => {
 
   it('keeps persisted note layouts tall enough for a readable text preview', () => {
     expect(toLayoutPatch({ ...baseNotes[0], height: 180 }).height).toBe(MIN_NOTE_HEIGHT);
+  });
+  it('returns layout patches only for notes whose arranged layout changed', () => {
+    const unchanged = { ...baseNotes[0], height: MIN_NOTE_HEIGHT };
+    const changed = { ...baseNotes[1], x: 48, y: 72, height: MIN_NOTE_HEIGHT };
+
+    expect(toChangedLayoutPatches([unchanged, baseNotes[1]], [unchanged, changed])).toEqual([
+      {
+        id: 2,
+        x: 48,
+        y: 72,
+        width: 260,
+        height: MIN_NOTE_HEIGHT,
+        rotation: -3,
+      },
+    ]);
+    expect(toChangedLayoutPatches([unchanged], [unchanged])).toEqual([]);
   });
 
   it('normalizes legacy default note heights so cards stay uniform', () => {

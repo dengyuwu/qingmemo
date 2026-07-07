@@ -1,4 +1,4 @@
-﻿import { MIN_NOTE_WIDTH, clampRotation, normalizeNoteHeight } from './features/sticky-wall/layout';
+import { MIN_NOTE_WIDTH, clampRotation, normalizeNoteHeight } from './features/sticky-wall/layout';
 import type { NoteColor, NotePriority, StickyNote } from './features/sticky-wall/types';
 import {
   describeAttachment,
@@ -140,6 +140,7 @@ export type DailyQueue = {
 
 export type DailyQueueItemStatus = 'open' | 'done' | 'skipped';
 export type DailyQueueStatusMap = Record<string, DailyQueueItemStatus>;
+export type DailyQueueNoteStatusMap = Record<number, Exclude<DailyQueueItemStatus, 'open'>>;
 
 export type DailyQueueProgress = {
   total: number;
@@ -179,6 +180,15 @@ export type DashboardStats = {
   reminders: number;
   highPriority: number;
   notes: number;
+  overdueReminders: number;
+  waitingNotes: number;
+  missingNextStepNotes: number;
+  completedToday: number;
+  delayDebt: number;
+  focusScore: number;
+  conversionRate: number;
+  cleanliness: number;
+  headline: string;
 };
 
 export type ReminderVisualTone = {
@@ -430,6 +440,15 @@ export function summarizeDailyQueueProgress(queue: DailyQueue, statuses: DailyQu
   return { total, done, skipped, open, label };
 }
 
+export function buildDailyQueueNoteStatusMap(queue: DailyQueue, statuses: DailyQueueStatusMap): DailyQueueNoteStatusMap {
+  return queue.items.reduce<DailyQueueNoteStatusMap>((result, item) => {
+    if (item.kind !== 'note') return result;
+    const status = getDailyQueueItemStatus(item, statuses);
+    if (status !== 'open') result[item.id] = status;
+    return result;
+  }, {});
+}
+
 export function buildAiNextStepPrompt(notes: StickyNote[], scope: 'selected' | 'workspace' = 'selected'): string {
   const activeNotes = notes.filter((note) => !note.archived).slice(0, 8);
   if (activeNotes.length === 0) {
@@ -545,14 +564,55 @@ export function buildDailyReview(notes: StickyNote[], reminders: BackendReminder
 
   return { completedReminders, overdueReminders, waitingNotes, highPriorityItems, cleanupSuggestions, summaryLines };
 }
-export function buildDashboardStats(notes: StickyNote[], reminders: BackendReminder[]): DashboardStats {
+export function buildDashboardStats(notes: StickyNote[], reminders: BackendReminder[], now = new Date()): DashboardStats {
+  const activeNotes = notes.filter((note) => !note.archived);
+  const activeReminders = reminders.filter((reminder) => !reminder.completed && !reminder.archived);
+  const nowMs = now.getTime();
+  const overdueReminders = activeReminders.filter((reminder) => {
+    const due = new Date(reminder.next_due_at ?? reminder.due_at).getTime();
+    return Number.isFinite(due) && due < nowMs;
+  }).length;
+  const waitingNotes = activeNotes.filter((note) => inferNoteCategory(`${note.title}\n${note.content}`) === 'waiting').length;
+  const missingNextStepNotes = findNotesMissingNextStep(activeNotes).length;
+  const completedToday = reminders.filter((reminder) => reminder.completed && isSameLocalDate(reminder.updated_at, now)).length;
+  const delayDebt = overdueReminders * 2 + waitingNotes + missingNextStepNotes;
+  const conversionRate = activeNotes.length === 0 ? 100 : Math.round(((activeNotes.length - missingNextStepNotes) / activeNotes.length) * 100);
+  const cleanliness = Math.max(0, 100 - buildWallCleanupSuggestions(activeNotes, now).length * 18);
+  const focusScore = clampPercent(100 - delayDebt * 10 + completedToday * 2);
+  const headline = overdueReminders > 0
+    ? '先清过期提醒'
+    : missingNextStepNotes > 0
+      ? '补齐下一步'
+      : completedToday > 0
+        ? '节奏不错'
+        : '挑一件事推进';
+
   return {
-    reminders: reminders.filter((reminder) => !reminder.completed && !reminder.archived).length,
+    reminders: activeReminders.length,
     highPriority:
-      notes.filter((note) => note.priority === 'high').length +
-      reminders.filter((reminder) => reminder.priority === 'high' && !reminder.completed && !reminder.archived).length,
-    notes: notes.length,
+      activeNotes.filter((note) => note.priority === 'high').length +
+      activeReminders.filter((reminder) => reminder.priority === 'high').length,
+    notes: activeNotes.length,
+    overdueReminders,
+    waitingNotes,
+    missingNextStepNotes,
+    completedToday,
+    delayDebt,
+    focusScore,
+    conversionRate,
+    cleanliness,
+    headline,
   };
+}
+
+function clampPercent(value: number): number {
+  return Math.max(0, Math.min(100, Math.round(value)));
+}
+
+function isSameLocalDate(value: string, target: Date): boolean {
+  const date = new Date(value);
+  if (!Number.isFinite(date.getTime())) return false;
+  return date.getFullYear() === target.getFullYear() && date.getMonth() === target.getMonth() && date.getDate() === target.getDate();
 }
 
 export function buildReminderInput(draft: ReminderInputDraft): ReminderInputPayload {

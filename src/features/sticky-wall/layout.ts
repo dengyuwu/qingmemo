@@ -172,7 +172,9 @@ export function compactSparseColumns(notes: StickyNote[], options: CompactSparse
   return changed ? notes.map((note) => compactedById.get(note.id) ?? note) : notes;
 }
 
-export function toLayoutPatch(note: StickyNote): LayoutPatch {
+export type LayoutComparable = Pick<StickyNote, 'id' | 'x' | 'y' | 'width' | 'height' | 'rotation'>;
+
+export function toLayoutPatch(note: LayoutComparable): LayoutPatch {
   return {
     id: note.id,
     x: note.x,
@@ -181,6 +183,27 @@ export function toLayoutPatch(note: StickyNote): LayoutPatch {
     height: normalizeNoteHeight(note.height),
     rotation: clampRotation(note.rotation),
   };
+}
+export function hasSameLayout(left: LayoutComparable, right: LayoutComparable): boolean {
+  const leftPatch = toLayoutPatch(left);
+  const rightPatch = toLayoutPatch(right);
+  return (
+    leftPatch.x === rightPatch.x &&
+    leftPatch.y === rightPatch.y &&
+    leftPatch.width === rightPatch.width &&
+    leftPatch.height === rightPatch.height &&
+    leftPatch.rotation === rightPatch.rotation
+  );
+}
+
+export function toChangedLayoutPatches(before: LayoutComparable[], after: LayoutComparable[]): LayoutPatch[] {
+  const beforeById = new Map(before.map((note) => [note.id, note]));
+  return after
+    .filter((note) => {
+      const previous = beforeById.get(note.id);
+      return !previous || !hasSameLayout(previous, note);
+    })
+    .map(toLayoutPatch);
 }
 
 export function resizeNote(note: StickyNote, delta: Point): StickyNote {

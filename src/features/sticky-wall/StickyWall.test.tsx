@@ -85,6 +85,35 @@ describe('StickyWall', () => {
     expect(bubbledMouseDown).not.toHaveBeenCalled();
   });
 
+
+  it('captures wheel zoom inside the canvas without bubbling to the page', () => {
+    const onCanvasStateChange = vi.fn();
+    const outerWheel = vi.fn();
+    const view = renderStickyWall([note], {
+      canvasState: { zoom: 1, panX: 0, panY: 0, snapToGrid: true, arrangeMode: 'battlefield' },
+      onCanvasStateChange,
+    });
+    const viewport = view.querySelector('[data-testid="sticky-wall-canvas-viewport"]');
+    document.body.addEventListener('wheel', outerWheel);
+
+    const wheel = new window.WheelEvent('wheel', { bubbles: true, cancelable: true, deltaY: 100 });
+    act(() => {
+      viewport?.dispatchEvent(wheel);
+    });
+    document.body.removeEventListener('wheel', outerWheel);
+
+    expect(viewport).not.toBeNull();
+    expect(wheel.defaultPrevented).toBe(true);
+    expect(outerWheel).not.toHaveBeenCalled();
+    expect(onCanvasStateChange).toHaveBeenCalledWith({ zoom: 0.92 });
+  });
+  it('shows daily queue completion state on the matching note card', () => {
+    const view = renderStickyWall([note], { dailyQueueNoteStatuses: { [note.id]: 'done' } });
+
+    expect(view.textContent).toContain('已完成');
+    expect(view.textContent).not.toContain('跟进中');
+    expect(view.textContent).not.toContain('修复中');
+  });
   it('archives from the bottom-right action button without selecting the card', () => {
     const onArchiveNote = vi.fn();
     const onSelectionChange = vi.fn();

@@ -14,6 +14,7 @@ export type StickyNote = {
   width: number;
   height: number;
   rotation: number;
+  skinId?: string;
   attachments: Array<{
     id?: number;
     path: string;

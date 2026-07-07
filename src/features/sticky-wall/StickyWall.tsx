@@ -1,11 +1,13 @@
 import { motion, type PanInfo } from 'framer-motion';
-import { useMemo, useRef, useState, type MouseEvent, type PointerEvent, type ReactNode, type TouchEvent } from 'react';
+import { useEffect, useMemo, useRef, useState, type MouseEvent, type PointerEvent, type ReactNode, type TouchEvent } from 'react';
 import { MIN_NOTE_HEIGHT, applyGroupDrag, compactSparseColumns, snapPoint, toLayoutPatch } from './layout';
 import { categoryHelp, categoryLabel, noteMood, noteMoodHelp } from './note-labels';
 import { buildWallExplorationState, countNotesByCategory, filterNotesByCategory, mergeVisibleNoteChanges, prepareVisibleNotes, type WallCategoryFilter, type WallExplorationMode } from './wall-filter';
+import type { DailyQueueNoteStatusMap } from '../../app-model';
 import type { LayoutPatch, NoteColor, StickyNote } from './types';
 import { inferNoteCategory } from '../../note-intelligence';
 import { FloatingActionBar } from '../actions/FloatingActionBar';
+import type { BattleCanvasState } from '../progress/progress-model';
 
 type StickyWallProps = {
   notes: StickyNote[];
@@ -24,8 +26,13 @@ type StickyWallProps = {
   onClearSelection?: () => void;
   explorationMode?: WallExplorationMode;
   challengeNoteIds?: number[];
+  dailyQueueNoteStatuses?: DailyQueueNoteStatusMap;
   onExplorationModeChange?: (mode: WallExplorationMode) => void;
   onAskAiNextStep?: (noteIds?: number[]) => void;
+  canvasState?: BattleCanvasState;
+  onCanvasStateChange?: (patch: Partial<BattleCanvasState>) => void;
+  noteSkinClass?: string;
+  noteSkinAccentClass?: string;
   motionMode?: 'calm' | 'lively' | 'wild';
   createdNoteId?: number | null;
   arranging?: boolean;
@@ -73,6 +80,17 @@ const iconClass: Record<NoteColor, string> = {
   slate: 'bg-white/10 text-white/76 ring-white/14',
 };
 
+const DEFAULT_CANVAS_STATE: BattleCanvasState = {
+  zoom: 1,
+  panX: 0,
+  panY: 0,
+  snapToGrid: true,
+  arrangeMode: 'battlefield',
+};
+
+function clampZoom(value: number) {
+  return Math.max(0.5, Math.min(3, Number(value.toFixed(2))));
+}
 const emptyCopies = [
   '没有便签，写一张灵感卡片吧，笨蛋。',
   '这里空空的，等你丢进第一张小纸条。',
@@ -97,8 +115,13 @@ export function StickyWall({
   onClearSelection,
   explorationMode = 'all',
   challengeNoteIds = [],
+  dailyQueueNoteStatuses = {},
   onExplorationModeChange,
   onAskAiNextStep,
+  canvasState = DEFAULT_CANVAS_STATE,
+  onCanvasStateChange,
+  noteSkinClass = '',
+  noteSkinAccentClass = '',
   motionMode = 'lively',
   createdNoteId,
   arranging = false,
@@ -106,6 +129,11 @@ export function StickyWall({
   const [savingId, setSavingId] = useState<number | null>(null);
   const [categoryFilter, setCategoryFilter] = useState<WallCategoryFilter>('all');
   const [contextMenu, setContextMenu] = useState<{ note: StickyNote; x: number; y: number } | null>(null);
+  const [spacePressed, setSpacePressed] = useState(false);
+  const [panning, setPanning] = useState(false);
+  const panStart = useRef<{ x: number; y: number; panX: number; panY: number } | null>(null);
+  const canvasViewportRef = useRef<HTMLDivElement | null>(null);
+  const effectiveCanvasState = { ...DEFAULT_CANVAS_STATE, ...canvasState };
   const dragStartNotes = useRef<StickyNote[]>([]);
   const emptyCopy = useMemo(() => emptyCopies[Math.floor(Math.random() * emptyCopies.length)], [notes.length]);
   const exploration = useMemo(() => buildWallExplorationState(notes, explorationMode, challengeNoteIds), [notes, explorationMode, challengeNoteIds]);
@@ -135,6 +163,72 @@ export function StickyWall({
   const calmMotion = motionMode === 'calm';
   const wildMotion = motionMode === 'wild';
 
+  useEffect(() => {
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.code === 'Space') setSpacePressed(true);
+    };
+    const handleKeyUp = (event: KeyboardEvent) => {
+      if (event.code === 'Space') setSpacePressed(false);
+    };
+    window.addEventListener('keydown', handleKeyDown);
+    window.addEventListener('keyup', handleKeyUp);
+    return () => {
+      window.removeEventListener('keydown', handleKeyDown);
+      window.removeEventListener('keyup', handleKeyUp);
+    };
+  }, []);
+
+  function patchCanvasState(patch: Partial<BattleCanvasState>) {
+    onCanvasStateChange?.(patch);
+  }
+
+  useEffect(() => {
+    const node = canvasViewportRef.current;
+    if (!node) return;
+    const handleNativeWheel = (event: globalThis.WheelEvent) => {
+      event.preventDefault();
+      event.stopPropagation();
+      const nextZoom = clampZoom(effectiveCanvasState.zoom + (event.deltaY > 0 ? -0.08 : 0.08));
+      patchCanvasState({ zoom: nextZoom });
+    };
+    node.addEventListener('wheel', handleNativeWheel, { passive: false });
+    return () => node.removeEventListener('wheel', handleNativeWheel);
+  }, [effectiveCanvasState.zoom, onCanvasStateChange]);
+
+  function beginCanvasPan(event: PointerEvent<HTMLDivElement>) {
+    if (event.button !== 1 && !spacePressed) return;
+    event.preventDefault();
+    setPanning(true);
+    panStart.current = {
+      x: event.clientX,
+      y: event.clientY,
+      panX: effectiveCanvasState.panX,
+      panY: effectiveCanvasState.panY,
+    };
+    event.currentTarget.setPointerCapture(event.pointerId);
+  }
+
+  function moveCanvasPan(event: PointerEvent<HTMLDivElement>) {
+    if (!panning || !panStart.current) return;
+    patchCanvasState({
+      panX: panStart.current.panX + event.clientX - panStart.current.x,
+      panY: panStart.current.panY + event.clientY - panStart.current.y,
+    });
+  }
+
+  function endCanvasPan(event: PointerEvent<HTMLDivElement>) {
+    if (!panning) return;
+    setPanning(false);
+    panStart.current = null;
+    if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+      event.currentTarget.releasePointerCapture(event.pointerId);
+    }
+  }
+
+  function zoomBy(delta: number) {
+    patchCanvasState({ zoom: clampZoom(effectiveCanvasState.zoom + delta) });
+  }
+
   function selectNote(noteId: number, additive: boolean) {
     setContextMenu(null);
     const next = new Set(additive ? selectedIds : []);
@@ -153,8 +247,12 @@ export function StickyWall({
 
   async function endDrag(activeId: number, info: PanInfo) {
     const activeSelection = selectedIds.has(activeId) ? selectedIds : new Set([activeId]);
-    const moved = applyGroupDrag(dragStartNotes.current, activeSelection, info.offset).map((note) => {
-      if (!activeSelection.has(note.id)) return note;
+    const offset = {
+      x: info.offset.x / effectiveCanvasState.zoom,
+      y: info.offset.y / effectiveCanvasState.zoom,
+    };
+    const moved = applyGroupDrag(dragStartNotes.current, activeSelection, offset).map((note) => {
+      if (!activeSelection.has(note.id) || !effectiveCanvasState.snapToGrid) return note;
       const snapped = snapPoint({ x: note.x, y: note.y }, { gridSize: 24, threshold: 7 });
       return { ...note, x: snapped.x, y: snapped.y };
     });
@@ -193,6 +291,20 @@ export function StickyWall({
 
   function stickyCategoryHelp(note: StickyNote): string {
     return categoryHelp(noteCategory(note));
+  }
+
+  function stickyMoodLabel(note: StickyNote): string {
+    const queueStatus = dailyQueueNoteStatuses[note.id];
+    if (queueStatus === 'done') return '已完成';
+    if (queueStatus === 'skipped') return '已跳过';
+    return noteMood(note);
+  }
+
+  function stickyMoodHelp(note: StickyNote): string {
+    const queueStatus = dailyQueueNoteStatuses[note.id];
+    if (queueStatus === 'done') return '已完成：这张便签在今日队列里已经完成';
+    if (queueStatus === 'skipped') return '已跳过：这张便签今天先不处理';
+    return noteMoodHelp(note);
   }
 
   if (notes.length === 0) {
@@ -273,7 +385,16 @@ export function StickyWall({
           </button>
         ))}
       </div>
-      <div className="relative min-h-0 flex-1 overflow-hidden" onClick={() => setContextMenu(null)}>
+      <div
+        ref={canvasViewportRef}
+        data-testid="sticky-wall-canvas-viewport"
+        className={`relative min-h-0 flex-1 overflow-hidden overscroll-contain ${panning ? 'cursor-grabbing' : spacePressed ? 'cursor-grab' : ''}`}
+        onClick={() => setContextMenu(null)}
+        onPointerDown={beginCanvasPan}
+        onPointerMove={moveCanvasPan}
+        onPointerUp={endCanvasPan}
+        onPointerCancel={endCanvasPan}
+      >
       <FloatingActionBar
         selectedCount={selectedIds.size}
         onArchive={() => onArchiveSelected?.()}
@@ -283,6 +404,28 @@ export function StickyWall({
         onClear={() => onClearSelection?.()}
         onAskAiNextStep={onAskAiNextStep ? () => onAskAiNextStep() : undefined}
       />
+      <div className="absolute bottom-3 left-4 z-30 flex items-center gap-1.5 rounded-full border border-white/70 bg-white/76 p-1 shadow-[0_12px_34px_rgba(15,23,42,.12)] backdrop-blur-xl">
+        <CanvasToolButton label="缩小" onClick={() => zoomBy(-0.12)}>-</CanvasToolButton>
+        <span className="min-w-12 text-center text-[11px] font-black text-zinc-500">{Math.round(effectiveCanvasState.zoom * 100)}%</span>
+        <CanvasToolButton label="放大" onClick={() => zoomBy(0.12)}>+</CanvasToolButton>
+        <button
+          type="button"
+          className={`rounded-full px-2.5 py-1 text-[11px] font-black transition ${effectiveCanvasState.snapToGrid ? 'bg-zinc-950 text-white' : 'bg-white/70 text-zinc-500 hover:bg-white'}`}
+          onClick={(event) => {
+            event.stopPropagation();
+            patchCanvasState({ snapToGrid: !effectiveCanvasState.snapToGrid });
+          }}
+        >
+          吸附
+        </button>
+      </div>
+      <div
+        className="absolute inset-0 origin-top-left"
+        style={{
+          transform: `translate3d(${effectiveCanvasState.panX}px, ${effectiveCanvasState.panY}px, 0) scale(${effectiveCanvasState.zoom})`,
+          transformOrigin: '0 0',
+        }}
+      >
       <DotGrid />
       <svg className="pointer-events-none absolute inset-0 z-[1] h-full w-full overflow-visible">
         {connections.map((connection) => (
@@ -384,7 +527,7 @@ export function StickyWall({
             } }
             transition={{ type: 'spring', stiffness: 360, damping: 28 }}
             style={{ minHeight: MIN_NOTE_HEIGHT }}
-            className={`group relative flex h-full w-full flex-col overflow-hidden rounded-[24px] border bg-gradient-to-br ${colorClass[note.color] ?? colorClass.butter} p-3.5 backdrop-blur-2xl before:pointer-events-none before:absolute before:inset-0 before:rounded-[24px] before:bg-[radial-gradient(circle_at_20%_0%,rgba(255,255,255,.92),transparent_32%),radial-gradient(circle_at_90%_88%,rgba(255,255,255,.44),transparent_38%),linear-gradient(135deg,rgba(255,255,255,.48),transparent_54%)] after:pointer-events-none after:absolute after:inset-[1px] after:rounded-[23px] after:border after:border-white/48 ${
+            className={`group relative flex h-full w-full flex-col overflow-hidden rounded-[24px] border bg-gradient-to-br ${colorClass[note.color] ?? colorClass.butter} p-3.5 backdrop-blur-2xl before:pointer-events-none before:absolute before:inset-0 before:rounded-[24px] before:bg-[radial-gradient(circle_at_20%_0%,rgba(255,255,255,.92),transparent_32%),radial-gradient(circle_at_90%_88%,rgba(255,255,255,.44),transparent_38%),linear-gradient(135deg,rgba(255,255,255,.48),transparent_54%)] after:pointer-events-none after:absolute after:inset-[1px] after:rounded-[23px] after:border after:border-white/48 ${noteSkinClass} ${
               selectedIds.has(note.id)
                 ? 'ring-2 ring-sky-500/58'
                 : savingId === note.id
@@ -395,7 +538,7 @@ export function StickyWall({
             }`}
           >
             <motion.div
-              className={`pointer-events-none absolute left-7 right-7 top-0 z-20 h-1 rounded-b-full bg-gradient-to-r ${accentClass[note.color] ?? accentClass.butter} opacity-85`}
+              className={`pointer-events-none absolute left-7 right-7 top-0 z-20 h-1 rounded-b-full bg-gradient-to-r ${noteSkinAccentClass || (accentClass[note.color] ?? accentClass.butter)} opacity-85`}
               animate={calmMotion ? { opacity: 0.8, scaleX: 1 } : selectedIds.has(note.id) ? { opacity: [0.7, 1, 0.7], scaleX: [0.86, 1.04, 0.86] } : { opacity: [0.72, 0.95, 0.72], scaleX: [0.92, 1, 0.92] }}
               transition={{ duration: selectedIds.has(note.id) ? 1.2 : 2.8, repeat: calmMotion ? 0 : Infinity, ease: 'easeInOut' }}
             />
@@ -419,12 +562,12 @@ export function StickyWall({
               >
                 {stickyCategoryLabel(note)}
               </span>
-              {noteMood(note) !== '进行中' && (
+              {stickyMoodLabel(note) !== '进行中' && (
                 <span
                   className="shrink-0 rounded-full border border-white/36 bg-white/30 px-2 py-0.5 text-[10px] font-black opacity-62 shadow-[inset_0_1px_0_rgba(255,255,255,.52)]"
-                  title={noteMoodHelp(note)}
+                  title={stickyMoodHelp(note)}
                 >
-                  {noteMood(note)}
+                  {stickyMoodLabel(note)}
                 </span>
               )}
               {note.pinned && (
@@ -532,11 +675,29 @@ export function StickyWall({
         </motion.div>
       ))}
       </div>
+      </div>
     </div>
   );
 }
 
 
+function CanvasToolButton({ label, onClick, children }: { label: string; onClick: () => void; children: ReactNode }) {
+  return (
+    <button
+      type="button"
+      aria-label={label}
+      title={label}
+      className="grid h-7 w-7 place-items-center rounded-full bg-white/70 text-xs font-black text-zinc-600 shadow-sm transition hover:bg-zinc-950 hover:text-white"
+      onPointerDown={(event) => event.stopPropagation()}
+      onClick={(event) => {
+        event.stopPropagation();
+        onClick();
+      }}
+    >
+      {children}
+    </button>
+  );
+}
 function StickyContextMenu({
   note,
   x,
