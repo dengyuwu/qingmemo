@@ -1,4 +1,4 @@
-﻿name: Build macOS app
+name: Build macOS app
 
 on:
   push:
@@ -43,7 +43,7 @@ jobs:
           workspaces: src-tauri -> target
 
       - name: Install frontend dependencies
-        run: npm ci
+        run: npm install --no-audit --no-fund
 
       - name: Typecheck
         run: npm run typecheck
